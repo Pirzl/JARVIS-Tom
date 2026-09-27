@@ -209,3 +209,23 @@ class WakeWordDetector:
                 self._queue.get_nowait()
         except Exception:
             pass
+
+    def reset(self) -> None:
+        """Discard all audio state — queue, model buffers, scores.
+
+        Called when the assistant falls asleep. Without it the model keeps the
+        features of the last thing the user said while AWAKE, and the first
+        chunk fed after sleeping completes those features into a phantom
+        detection: the log shows "Awake — wake word" for a phrase that ended
+        seconds before the assistant went to sleep.
+
+        `Model.reset()` also throws away the mel/embedding state, so the next
+        detection needs a full phrase from scratch. That is the cost of not
+        waking on stale audio.
+        """
+        self._drain()
+        try:
+            if self._model is not None:
+                self._model.reset()
+        except Exception as e:
+            self._logger(f"Wake word: reset error — {e}")

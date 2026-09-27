@@ -797,6 +797,15 @@ class JarvisLive(LiveConfigMixin, BackgroundLoopsMixin):
             return
         self._awake = False
         self.set_speaking(False)
+        # Throw away the detector's audio state. While awake the mic does not
+        # feed the detector, so its buffers still hold the tail of what the user
+        # last said; the first chunks after sleeping would complete those
+        # features and report a wake word for a phrase that is already over.
+        if self._wake_detector is not None:
+            try:
+                self._wake_detector.reset()
+            except Exception as e:
+                print(f"[JARVIS] wake reset error: {e}")
         self.ui.set_state("SLEEPING")
         self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey Jarvis' to wake me.")
 
