@@ -58,6 +58,10 @@ class DeepEyeSessionMixin:
         """
         self._deep_eye_scan = None
         self.ui.on_deep_eye_cancel = self._de_cancel_scan  # () -> None
+        # The panel's SCAN button. It routes through request_scan, the same
+        # entry point the voice tool uses, so the gate is raised in exactly
+        # one place and no caller can drift from it.
+        self.ui.on_deep_eye_scan = self._de_request_scan  # (str) -> None
         try:
             from actions import deep_eye as _de_action
             _de_action.bind_session(
@@ -69,6 +73,32 @@ class DeepEyeSessionMixin:
             print(f"[JARVIS] deep eye bind error: {e}")
 
     # ── lifecycle ──────────────────────────────────────────────────────────
+
+    def _de_request_scan(self, target: str) -> None:
+        """A scan was asked for from the panel.
+
+        Goes through the same `request_scan` the voice tool uses, which is the
+        one place that normalises the target, checks the install, and raises
+        the confirmation gate. The panel has no privileged route of its own —
+        if it had, the two paths could drift and one of them would end up
+        scanning without asking.
+        """
+        from core import confirm as _confirm
+        from core import deep_eye as _de
+        try:
+            _de.request_scan(target, _confirm.request,
+                             on_begin=self._de_on_begin,
+                             on_line=self._de_on_line,
+                             on_done=self._de_on_done)
+        except Exception as e:
+            print(f"[JARVIS] deep eye request error: {e}")
+            try:
+                self.ui._win._de_panel_or_none()
+                panel = self.ui._win._de_panel
+                panel._status.setText(f"Could not start: {e}")
+                panel._scan_btn.setEnabled(True)
+            except Exception:
+                pass
 
     def _de_cancel_scan(self) -> None:
         """STOP pressed.

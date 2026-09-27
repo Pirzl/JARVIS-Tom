@@ -30,6 +30,7 @@ from core.deep_eye_session import (  # noqa: E402
 
 MIXIN_METHODS = (
     "bind_deep_eye",
+    "_de_request_scan",
     "_de_cancel_scan",
     "_de_ensure_panel",
     "_de_on_begin",
@@ -96,10 +97,18 @@ class TestWorstSeverity(unittest.TestCase):
 
 
 def _session():
-    """A JarvisLive-shaped stub with a recording UI."""
+    """A JarvisLive-shaped stub with a recording UI.
+
+    The UI records calls *and* accepts attribute assignment: bind_deep_eye
+    stores its two callbacks on it, and a stub that only records would fail
+    with AttributeError before reaching the behaviour under test.
+    """
     calls = []
 
     class UI:
+        def __setattr__(self, name, value):
+            object.__setattr__(self, name, value)
+
         def __getattr__(self, name):
             def rec(*a, **k):
                 calls.append((name, a, k))
@@ -140,6 +149,25 @@ class TestSessionBehaviour(unittest.TestCase):
         s.bind_deep_eye()
         # A no-op UI records nothing, so check the attribute exists at all.
         self.assertTrue(hasattr(s.ui, "on_deep_eye_cancel"))
+
+    def test_bind_registers_the_scan_request_handler(self):
+        """The panel's SCAN button reaches the gate through this. Missing, the
+        button would report "Not available" and the panel would be decoration."""
+        s, _, _ = _session()
+        s.bind_deep_eye()
+        self.assertTrue(hasattr(s.ui, "on_deep_eye_scan"))
+
+    def test_the_scan_request_goes_through_the_shared_gate(self):
+        """The panel must use request_scan, the same entry point as the voice
+        tool. A second route into confirm.py is a second chance to scan without
+        asking, which is the one thing this feature must never do."""
+        import inspect
+        from core import confirm as _confirm
+        src = inspect.getsource(DeepEyeSessionMixin._de_request_scan)
+        self.assertIn("request_scan", src)
+        self.assertIn("confirm", src)
+        # ...and it must not resolve() the gate itself.
+        self.assertNotIn("_confirm.resolve", src)
 
     def test_a_raising_cancel_does_not_break_stop(self):
         s, calls, _ = _session()

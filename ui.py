@@ -4546,8 +4546,18 @@ class MainWindow(QMainWindow):
             from ui_deep_eye import DeepEyePanel
             panel = DeepEyePanel(self)
             panel.on_stop = self.on_deep_eye_stop
+            # SCAN in the panel is a request, not a command. It goes to the
+            # same gate as the voice path, so a click can never start a scan
+            # on its own.
+            panel.on_request = self.on_deep_eye_request
             self._de_panel = panel
         self._position_deep_eye(panel)
+        # Reopening after a finished scan shows the previous run's output
+        # unless it is reset. That reads as the new state of the world rather
+        # than the last thing that happened, so the panel goes back to idle
+        # unless a scan is in flight.
+        if panel.isVisible() is False and not getattr(panel, "_running", False):
+            panel.reset()
         panel.show()
         panel.raise_()
 
@@ -4565,6 +4575,29 @@ class MainWindow(QMainWindow):
         panel.setFixedSize(max(w, 380), max(h, 260))
         panel.move((host.width() - panel.width()) // 2,
                    (host.height() - panel.height()) // 2)
+
+    def on_deep_eye_request(self, target: str) -> None:
+        """SCAN pressed in the panel.
+
+        Delegates to the same entry point the voice tool uses, so the target is
+        normalised and the confirmation gate is raised exactly once, in
+        core/deep_eye.py. The panel itself never talks to confirm.py — one
+        place validates, so no caller can drift from it.
+        """
+        cb = getattr(self, "on_deep_eye_scan", None)
+        if not callable(cb):
+            panel = self._de_panel_or_none()
+            if panel is not None:
+                panel._status.setText("Not available")
+                panel._scan_btn.setEnabled(True)
+            return
+        try:
+            cb(target)
+        except Exception as e:
+            panel = self._de_panel_or_none()
+            if panel is not None:
+                panel._status.setText(f"Could not start: {e}")
+                panel._scan_btn.setEnabled(True)
 
     def on_deep_eye_stop(self) -> None:
         """Asked by the panel's STOP button. JarvisLive sets the real handler."""

@@ -160,6 +160,140 @@ class TestPanel(PanelTestCase):
         self.assertIn("No findings", panel._verdict.text())
 
 
+class TestIdleState(PanelTestCase):
+    """The reported bug: the popup opened and showed nothing at all.
+
+    An empty log box above a blank verdict is indistinguishable from a broken
+    feature — Thomas could not tell whether Deep Eye had failed to start or
+    whether it was simply waiting. So the resting state says what it is and
+    offers the one action available, and the log stays hidden until it has
+    something in it.
+    """
+
+    def test_opening_shows_instructions_not_a_blank_box(self):
+        self.w._toggle_deep_eye(True)
+        _app.processEvents()
+        panel = self.w._de_panel
+        self.assertTrue(panel._idle.isVisible(), "the idle help is not shown")
+        self.assertIn("permission", panel._idle.text().lower())
+        self.assertIn("confirm", panel._idle.text().lower())
+
+    def test_the_empty_log_is_hidden_when_idle(self):
+        self.w._toggle_deep_eye(True)
+        _app.processEvents()
+        self.assertFalse(self.w._de_panel._log.isVisible(),
+                         "an empty log box is what looked broken")
+
+    def test_the_two_states_are_mutually_exclusive(self):
+        self.w._toggle_deep_eye(True)
+        _app.processEvents()
+        panel = self.w._de_panel
+        panel.begin("example.com")
+        self.assertFalse(panel._idle.isVisible())
+        self.assertTrue(panel._log.isVisible())
+
+    def test_there_is_a_way_to_type_a_target(self):
+        self.w._toggle_deep_eye(True)
+        _app.processEvents()
+        panel = self.w._de_panel
+        self.assertTrue(panel._target_edit.isEnabled())
+        self.assertTrue(panel._scan_btn.isEnabled())
+
+    def test_the_scan_button_does_not_scan(self):
+        """It asks. A click must never start an attack on a third party."""
+        self.w._toggle_deep_eye(True)
+        _app.processEvents()
+        panel = self.w._de_panel
+        asked = []
+        panel.on_request = lambda t: asked.append(t)
+        panel._target_edit.setText("example.com")
+        panel._scan_btn.click()
+        self.assertEqual(asked, ["example.com"])
+
+    def test_an_empty_target_asks_instead_of_doing_nothing(self):
+        self.w._toggle_deep_eye(True)
+        _app.processEvents()
+        panel = self.w._de_panel
+        asked = []
+        panel.on_request = lambda t: asked.append(t)
+        panel._target_edit.setText("   ")
+        panel._scan_btn.click()
+        self.assertEqual(asked, [])
+        self.assertIn("site", panel._status.text().lower())
+
+    def test_a_missing_owner_says_so_instead_of_hanging(self):
+        """A dead SCAN button with no explanation reads as a crash."""
+        self.w._toggle_deep_eye(True)
+        _app.processEvents()
+        panel = self.w._de_panel
+        panel.on_request = None
+        panel._target_edit.setText("example.com")
+        panel._start_clicked()
+        self.assertIn("not available", panel._status.text().lower())
+        self.assertTrue(panel._scan_btn.isEnabled())
+
+    def test_an_raising_owner_restores_the_button(self):
+        self.w._toggle_deep_eye(True)
+        _app.processEvents()
+        panel = self.w._de_panel
+
+        def boom(t):
+            raise RuntimeError("gate unavailable")
+
+        panel.on_request = boom
+        panel._target_edit.setText("example.com")
+        panel._start_clicked()
+        self.assertTrue(panel._scan_btn.isEnabled())
+        self.assertIn("could not start", panel._status.text().lower())
+
+    def test_pressing_enter_asks_too(self):
+        self.w._toggle_deep_eye(True)
+        _app.processEvents()
+        panel = self.w._de_panel
+        asked = []
+        panel.on_request = lambda t: asked.append(t)
+        panel._target_edit.setText("example.com")
+        panel._target_edit.returnPressed.emit()
+        self.assertEqual(asked, ["example.com"])
+
+
+class TestReopening(PanelTestCase):
+    def test_reopening_after_a_scan_does_not_show_the_old_results(self):
+        """Otherwise the previous run's output sits under a fresh status
+        line, and reads as the current state of the site."""
+        self.w._toggle_deep_eye(True)
+        panel = self.w._de_panel
+        panel.begin("example.com")
+        panel.append_line("SQLi: 2 candidates  <-- HIGH")
+        panel.end(True, "1 findings\nHIGH: 1")
+        panel.close_panel()
+        self.w._toggle_deep_eye(True)
+        _app.processEvents()
+        self.assertEqual(panel._log.toPlainText(), "")
+        self.assertTrue(panel._idle.isVisible())
+
+    def test_reopening_during_a_scan_keeps_the_output(self):
+        """The user closed it to see the face and came back — wiping the log
+        mid-scan would look like the scan died."""
+        self.w._toggle_deep_eye(True)
+        panel = self.w._de_panel
+        panel.begin("example.com")
+        panel.append_line("still scanning")
+        panel.close_panel()
+        self.w._toggle_deep_eye(True)
+        _app.processEvents()
+        self.assertIn("still scanning", panel._log.toPlainText())
+        self.assertTrue(panel._running)
+
+    def test_a_second_scan_can_be_asked_for_after_the_first(self):
+        self.w._toggle_deep_eye(True)
+        panel = self.w._de_panel
+        panel.begin("example.com")
+        panel.end(True, "done")
+        self.assertTrue(panel._scan_btn.isEnabled(),
+                        "the target row stayed dead after a finished scan")
+
+
 class TestWorstSeverity(unittest.TestCase):
     def test_reports_the_most_serious(self):
         res = de.ScanResult(target="x", returncode=0, findings=[

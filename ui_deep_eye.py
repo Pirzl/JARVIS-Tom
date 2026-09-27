@@ -25,8 +25,8 @@ import re
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QTextEdit,
-    QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QProgressBar, QPushButton,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 # ANSI box-drawing and emoji arrive in deep-eye's output; Qt renders the second
@@ -65,6 +65,13 @@ class DeepEyePanel(QFrame):
             QLabel#deTarget  { color: #b0bec5; font-family: 'Courier New'; font-size: 8pt; }
             QLabel#deStatus  { color: #8bc34a; font-family: 'Courier New'; font-size: 8pt; }
             QLabel#deVerdict { color: #e0e0e0; font-family: 'Courier New'; font-size: 9pt; }
+            QLabel#deIdle   { color: #607d8b; font-family: 'Courier New'; font-size: 8pt; }
+            QLineEdit#deTargetEdit {
+                background: #04080e; color: #b0bec5; border: 1px solid #1f4a63;
+                border-radius: 3px; font-family: 'Courier New'; font-size: 8pt;
+                padding: 3px 5px;
+            }
+            QLineEdit#deTargetEdit:focus { border-color: #4fc3f7; }
             QTextEdit        { background: #04080e; color: #7fb3c8;
                                border: 1px solid #143244; border-radius: 4px;
                                font-family: 'Courier New'; font-size: 8pt; }
@@ -76,6 +83,10 @@ class DeepEyePanel(QFrame):
                                font-family: 'Courier New'; font-size: 8pt; }
             QPushButton:hover      { color: #4fc3f7; border-color: #4fc3f7; }
             QPushButton#deStop:hover { color: #ef5350; border-color: #ef5350; }
+            QPushButton#deScan   { color: #4fc3f7; border-color: #1f4a63;
+                                   padding: 0 10px; }
+            QPushButton#deScan:hover   { background: #0d2836; }
+            QPushButton#deScan:disabled { color: #37474f; border-color: #14232c; }
         """)
 
         lay = QVBoxLayout(self)
@@ -114,6 +125,42 @@ class DeepEyePanel(QFrame):
         self._log.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         lay.addWidget(self._log, 1)
 
+        # ── the idle state ────────────────────────────────────────────────
+        # An empty panel is indistinguishable from a broken one. The first
+        # version opened to a blank log and a bare "Idle", which looked
+        # exactly like a feature that failed to start. The panel now says
+        # what it is, what it will do, and offers the one thing you can do
+        # from here.
+        self._idle = QLabel(
+            "No scan running.\n\n"
+            "Type a site you own or have permission to audit, "
+            "then press SCAN.\n\n"
+            "JARVIS will always ask you to confirm before it "
+            "touches any server."
+        )
+        self._idle.setObjectName("deIdle")
+        self._idle.setWordWrap(True)
+        self._idle.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(self._idle)
+
+        self._row_target = QLabel("Site:")
+        self._row_target.setObjectName("deTarget")
+        self._target_edit = QLineEdit()
+        self._target_edit.setObjectName("deTargetEdit")
+        self._target_edit.setPlaceholderText("ejemplo.com")
+        self._target_edit.returnPressed.connect(lambda: self._start_clicked())
+        self._scan_btn = QPushButton("SCAN")
+        self._scan_btn.setObjectName("deScan")
+        self._scan_btn.setFixedHeight(26)
+        self._scan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._scan_btn.clicked.connect(self._start_clicked)
+        ent_row = QHBoxLayout()
+        ent_row.setSpacing(6)
+        ent_row.addWidget(self._row_target)
+        ent_row.addWidget(self._target_edit, 1)
+        ent_row.addWidget(self._scan_btn)
+        lay.addLayout(ent_row)
+
         self._verdict = QLabel("")
         self._verdict.setObjectName("deVerdict")
         self._verdict.setWordWrap(True)
@@ -139,9 +186,14 @@ class DeepEyePanel(QFrame):
         lay.addLayout(row)
 
         self.on_stop = None          # set by the owner
+        self.on_request = None       # set by the owner: (target) -> None
         self._tick = QTimer(self)
         self._tick.timeout.connect(self._nudge_pulse)
         self._phase = 0
+        # True between begin() and end(). The header button consults it so a
+        # reopen during a scan does not wipe the output the user is watching.
+        self._running = False
+        self._show_idle()
 
     def _nudge_pulse(self) -> None:
         """The indeterminate bar is enough on its own; this only repaints so
@@ -151,7 +203,55 @@ class DeepEyePanel(QFrame):
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
+    def _show_idle(self) -> None:
+        """The resting state: instructions up, log and verdict down.
+
+        A log box sitting empty above a blank verdict is what made the first
+        version look broken, so the log is hidden until there is something in
+        it. The two states are mutually exclusive by construction — a run
+        cannot leave an empty log on screen pretending to be idle.
+        """
+        self._idle.setVisible(True)
+        self._log.setVisible(False)
+        self._verdict.setVisible(False)
+        self._pulse.setVisible(False)
+        self._tick.stop()
+        self._stop_btn.setVisible(False)
+        self._status.setText("Idle")
+        self._target.setText("")
+
+    def _start_clicked(self) -> None:
+        """SCAN pressed. This does NOT start a scan.
+
+        It hands the target to the owner, which routes it through the same
+        confirmation gate as the voice path. The button is a way of asking, not
+        a way of doing — a scan of somebody's server must never begin from a
+        click without the HUD asking Thomas first.
+        """
+        target = self._target_edit.text().strip()
+        if not target:
+            self._status.setText("Type a site first")
+            self._target_edit.setFocus()
+            return
+        self._scan_btn.setEnabled(False)
+        self._status.setText("Asking for confirmation...")
+        if callable(self.on_request):
+            try:
+                self.on_request(target)
+            except Exception as e:
+                self._scan_btn.setEnabled(True)
+                self._status.setText(f"Could not start: {e}")
+            return
+        # No owner wired: say so rather than sitting silent forever.
+        self._scan_btn.setEnabled(True)
+        self._status.setText("Not available")
+
     def begin(self, target: str) -> None:
+        self._running = True
+        self._idle.setVisible(False)
+        self._log.setVisible(True)
+        self._scan_btn.setEnabled(False)
+        self._target_edit.setText(target)
         self._log.clear()
         self._verdict.setVisible(False)
         self._verdict.clear()
@@ -163,13 +263,29 @@ class DeepEyePanel(QFrame):
         self.raise_()
 
     def end(self, ok: bool, message: str) -> None:
+        """The run is over. Keep the output and the verdict on screen — the
+        user needs to read them — and re-enable the target row so a second
+        audit can be started without closing anything."""
+        self._running = False
         self._pulse.setVisible(False)
         self._tick.stop()
         self._stop_btn.setVisible(False)
+        self._scan_btn.setEnabled(True)
         self._status.setText("Done" if ok else "Stopped")
         self._verdict.setText(message)
         self._verdict.setVisible(True)
         self.raise_()
+
+    def reset(self) -> None:
+        """Back to the resting state, with the log emptied.
+
+        Without the clear(), reopening the panel after a finished scan showed
+        the previous run's output next to a fresh status line, which reads as
+        the new scan having already found the same things.
+        """
+        self._log.clear()
+        self._target_edit.clear()
+        self._show_idle()
 
     def close_panel(self) -> None:
         """Closing the panel hides it; it must not stop a running scan, which
@@ -209,9 +325,11 @@ class DeepEyePanel(QFrame):
 
     def show_findings(self, result) -> None:
         """Render a finished ScanResult as labelled counts."""
+        self._running = False
         self._pulse.setVisible(False)
         self._tick.stop()
         self._stop_btn.setVisible(False)
+        self._scan_btn.setEnabled(True)
         self._status.setText("Done" if result.ok else "Finished with errors")
 
         by_sev: dict = {}
