@@ -361,6 +361,17 @@ class DeepEyeScan:
         # Deep Eye is synchronous and prints progress; unbuffered keeps the
         # stream honest so the UI is not a lie about how far along it is.
         env["PYTHONUNBUFFERED"] = "1"
+        # Force UTF-8 on the child's pipes. Windows otherwise hands the child a
+        # cp1252 stdout, and Deep Eye's very first act is to print a banner of
+        # box-drawing characters — which cp1252 cannot encode. The child died
+        # with a UnicodeEncodeError before a single check ran, while the
+        # installed-and-working scanner looked broken from the outside.
+        #
+        # This is why the same command worked from the shell and not from
+        # here: there stdout was already UTF-8.
+        env["PYTHONIOENCODING"] = "utf-8"
+        # ...and to the Rich console, which is what actually writes the banner.
+        env.setdefault("PYTHONUTF8", "1")
         env.pop("PYTHONHOME", None)
         # Hand over JARVIS's Gemini key to the scanner, but only through the
         # child's environment — never on disk and never in argv, where it would

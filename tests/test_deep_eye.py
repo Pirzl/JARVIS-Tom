@@ -14,6 +14,8 @@ safe local target when the tool is installed.
 """
 from __future__ import annotations
 
+import os
+
 import subprocess
 import sys
 import types
@@ -374,3 +376,97 @@ class TestConsentGate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheChildGetsAUtf8Stdout(unittest.TestCase):
+    """Regression: the scanner died on its very first banner.
+
+    Thomas hit, on the first confirmed scan:
+
+        'charmap' codec can't encode characters in position 0-78
+        vendor/deep-eye/deep_eye.py line 162, in display_banner
+            console.print(BANNER, style="bold cyan")
+
+    position 0-78 is the whole banner; "charmap" is cp1252, the encoding
+    Windows gives a console-less process. JARVIS is started with pythonw.exe —
+    no console window — so the scanner inherited cp1252, and Rich's very first
+    write (box-drawing and braille characters) raised UnicodeEncodeError
+    before a single check ran. The installed, working scanner looked broken.
+
+    Note what does NOT fix this: DeepEyeScan already passes
+    `encoding="utf-8"` to Popen. That only controls how the *parent* decodes
+    the pipe. The child is what crashes, writing to its own stdout. The
+    child's encoding is set by its environment, so that is where the fix has
+    to be.
+    """
+
+    def _child_env(self, parent_env):
+        """The env DeepEyeScan would hand the child, given a parent env."""
+        import copy
+        import core.deep_eye as de
+        captured = {}
+
+        class _P:
+            def __init__(self, *a, **k):
+                captured["env"] = k.get("env")
+                self.stdout = self.stderr = None
+                self.returncode = 0
+                self.pid = 0
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        real = de.subprocess.Popen
+        de.subprocess.Popen = _P
+        real_environ = os.environ
+        os.environ = copy.copy(parent_env)
+        try:
+            de.DeepEyeScan("example.com", timeout=1).start()
+        except Exception:
+            pass
+        finally:
+            de.subprocess.Popen = real
+            os.environ = real_environ
+        return captured.get("env") or {}
+
+    def _windows_console_less_parent(self):
+        """What JARVIS actually looks like: pythonw.exe, so no PYTHONIOENCODING
+        anywhere and the system default is cp1252."""
+        return {k: v for k, v in os.environ.items()
+                if k not in ("PYTHONIOENCODING", "PYTHONUTF8")}
+
+    def test_the_child_is_told_utf8_even_when_the_parent_says_nothing(self):
+        """The regression itself, stated as the failing condition: a parent
+        with no encoding declared is exactly the pythonw.exe case."""
+        env = self._child_env(self._windows_console_less_parent())
+        self.assertEqual(env.get("PYTHONIOENCODING"), "utf-8",
+                         "the child inherits cp1252 and dies printing its "
+                         "own banner, before scanning anything")
+
+    def test_utf8_mode_is_set_too(self):
+        """PYTHONUTF8 covers the paths that reconfigure the stream after
+        start-up, which PYTHONIOENCODING alone does not."""
+        env = self._child_env(self._windows_console_less_parent())
+        self.assertIn("PYTHONUTF8", env)
+
+    def test_the_banner_itself_would_crash_a_cp1252_child(self):
+        """Why the child needs this at all: the very first thing it prints
+        contains characters cp1252 cannot encode. If this ever stops being
+        true, the fix becomes dead code and the test should say so."""
+        self.assertTrue(any(ord(c) > 0x2500 for c in "\u2500\u256d\u2500\u2524"),
+                        "the sample no longer contains box drawing")
+        try:
+            "\u256d\u2500\u2524".encode("cp1252")
+        except UnicodeEncodeError:
+            pass                      # what we expect: it cannot be encoded
+        else:
+            self.fail("cp1252 now encodes box drawing; re-check the child env")
