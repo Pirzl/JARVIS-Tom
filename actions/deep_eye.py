@@ -32,6 +32,40 @@ from core import deep_eye as de  # noqa: E402
 from core import confirm as _confirm  # noqa: E402
 from core.deep_eye import available  # noqa: E402  (re-exported for _status)
 
+# The panel and the avatar line, reached without importing ui.py.
+#
+# The action loader calls handlers as `fn(parameters=..., **ctx)` — there is no
+# `self`, because an action is a module, not a method. An earlier version of
+# this file called `self._ensure_deep_eye_panel()` and only failed when the
+# voice path was actually exercised. So the session is reached through a
+# module-level function that JarvisLive sets at startup, and which degrades to
+# a no-op if nobody has. That keeps the action importable and callable in a
+# test, which is where the gate is verified.
+_on_begin = None      # (target: str) -> None
+_on_line = None       # (line: str) -> None
+_on_done = None       # (ok: bool, payload) -> None
+
+
+def bind_session(on_begin=None, on_line=None, on_done=None) -> None:
+    """Wire the live session in. Called once by JarvisLive.__init__."""
+    global _on_begin, _on_line, _on_done
+    _on_begin, _on_line, _on_done = on_begin, on_line, on_done
+
+
+def _open_panel() -> None:
+    """Show the panel, whatever the session is."""
+    try:
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is None:
+            return
+        for w in app.topLevelWidgets():
+            if hasattr(w, "_toggle_deep_eye"):
+                w._toggle_deep_eye(True)
+                return
+    except Exception:
+        pass
+
 
 def deep_eye(params: dict, speak=None) -> str:
     """Entry point for the `deep_eye` tool.
@@ -49,10 +83,16 @@ def deep_eye(params: dict, speak=None) -> str:
     if action == "scan":
         if not target:
             return "Which site should I scan? Give me a domain, like example.com."
+        # Show the panel BEFORE the gate. If the user then cancels, an empty
+        # panel is visible and honest: it shows what was about to happen, and
+        # that it did not happen.
+        _open_panel()
         # request_scan validates, checks the install, and raises the gate. It
-        # returns the sentence for the model to say; the work happens later, on
-        # the Qt thread, only if Thomas presses CONFIRM.
-        return de.request_scan(target, _confirm.request)
+        # returns the sentence for the model to say; the work happens later,
+        # off the Qt thread, only if Thomas presses CONFIRM.
+        return de.request_scan(target, _confirm.request,
+                               on_begin=_on_begin, on_line=_on_line,
+                               on_done=_on_done)
 
     return (f"Unknown action {action!r}. I can do 'scan' (audit a site you own) "
             "or 'status' (check whether the scanner is installed).")

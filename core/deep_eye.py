@@ -228,6 +228,21 @@ class ScanResult:
                 f" ({', '.join(parts)}).")
 
 
+def _gemini_key() -> str:
+    """JARVIS's Gemini key, or "".
+
+    Read through core.gemini.api_key() rather than parsing the JSON here, so
+    there is one place that knows where the key lives and how it is cached. A
+    missing or unreadable key is not an error — Deep Eye's rule-based checks
+    work without one — so this never raises.
+    """
+    try:
+        from core.gemini import api_key
+        return str(api_key() or "")
+    except Exception:
+        return ""
+
+
 def _parse_json_findings(stdout: str) -> tuple[list, Optional[Path]]:
     """Pull findings out of deep-eye's output.
 
@@ -281,11 +296,13 @@ class DeepEyeScan:
 
     def __init__(self, target: str, timeout: float = DEFAULT_TIMEOUT,
                  extra_args: Optional[list[str]] = None,
-                 formats: str = "json"):
+                 formats: str = "json",
+                 logger: Optional[Callable[[str], None]] = None):
         self.target = normalize_target(target)
         self.timeout = float(timeout)
         self.extra_args = list(extra_args or [])
         self.formats = formats
+        self._logger = logger or (lambda _m: None)
         self._proc: Optional[subprocess.Popen] = None
         self._thread: Optional[threading.Thread] = None
         self._cancelled = threading.Event()
@@ -345,6 +362,22 @@ class DeepEyeScan:
         # stream honest so the UI is not a lie about how far along it is.
         env["PYTHONUNBUFFERED"] = "1"
         env.pop("PYTHONHOME", None)
+        # Hand over JARVIS's Gemini key to the scanner, but only through the
+        # child's environment — never on disk and never in argv, where it would
+        # be visible in any process listing. The AI provider is what generates
+        # payloads and filters false positives, which is most of the difference
+        # between a useful report and a wall of noise.
+        key = _gemini_key()
+        if key:
+            env["GEMINI_API_KEY"] = key
+            env.setdefault("GOOGLE_API_KEY", key)
+        else:
+            # Deep Eye's config has gemini enabled. Without a key it initialises
+            # the provider and then fails on the first request, so the scan
+            # degrades to the rule-based checks — worth saying out loud rather
+            # than letting it look like the AI silently worked.
+            self._logger("Deep Eye: no Gemini key found; AI checks will be skipped.")
+        env["DEEP_EYE_NO_KEY_WARNING"] = "1" if not key else ""
         flags = 0
         if sys.platform == "win32":
             # Hide the console window that a child process would otherwise
@@ -443,6 +476,7 @@ class DeepEyeScan:
 
 
 def request_scan(target: str, confirm, speak=None, on_line=None,
+                 on_begin=None, on_done=None,
                  timeout: float = DEFAULT_TIMEOUT) -> str:
     """Ask for consent, and only then scan.
 
@@ -465,13 +499,37 @@ def request_scan(target: str, confirm, speak=None, on_line=None,
         return str(e)
 
     def _run() -> str:
+        if callable(on_begin):
+            try:
+                on_begin(host)
+            except Exception:
+                pass
         scan = DeepEyeScan(host, timeout=timeout)
+        # The line callback runs on the reader thread. Anything it touches
+        # that belongs to Qt must marshal itself; the UI's signals do that.
+        scan.start(on_line=on_line)
         try:
             result = scan.wait()
         except ScanCancelled as e:
+            if callable(on_done):
+                try:
+                    on_done(False, str(e))
+                except Exception:
+                    pass
             return str(e)
         except Exception as e:
-            return f"The scan of {host} failed: {e}"
+            msg = f"The scan of {host} failed: {e}"
+            if callable(on_done):
+                try:
+                    on_done(False, msg)
+                except Exception:
+                    pass
+            return msg
+        if callable(on_done):
+            try:
+                on_done(result.ok, result)
+            except Exception:
+                pass
         return result.summary()
 
     return confirm(

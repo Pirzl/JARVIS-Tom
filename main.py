@@ -80,6 +80,7 @@ from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from core.live_config          import LiveConfigMixin
 from core.background_loops     import BackgroundLoopsMixin
+from core.deep_eye_session     import DeepEyeSessionMixin
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
@@ -96,7 +97,6 @@ from core.wake_word            import (
 # awake until you put it to sleep yourself, which is the right setting when
 # the mic is far away and waking it by hand is impractical.
 WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
-
 
 def _wake_state_label(seconds: float) -> str:
     """Human form of a listening window, for the log and the settings row."""
@@ -581,7 +581,7 @@ def _keep_context_of(exc: BaseException) -> bool:
     return True
 
 
-class JarvisLive(LiveConfigMixin, BackgroundLoopsMixin):
+class JarvisLive(LiveConfigMixin, BackgroundLoopsMixin, DeepEyeSessionMixin):
     # core/live_config.py builds the LiveConnectConfig and reads a handful of
     # names that live at main.py module level (the prompt template helpers and
     # the inline tool declarations). Binding them here keeps the extracted
@@ -714,6 +714,10 @@ class JarvisLive(LiveConfigMixin, BackgroundLoopsMixin):
         self.ui.on_wake_manual   = self._ui_wake_manual   # () -> toggle awake/asleep
         self.ui.on_wake_install  = self._ui_wake_install  # () -> (ok, msg)
         self.ui.on_wake_set_timeout = self._set_wake_timeout_live  # (s) -> None
+        # Deep Eye: the panel's STOP button and the action module's callbacks.
+        # One scan at a time — a second started while one is in flight would
+        # double the traffic against the same target.
+        self.bind_deep_eye()
 
         # Hand the extracted prompt builder (core/live_config.py) the module
         # level names it reads. Last thing in __init__ so every registry it

@@ -39,6 +39,14 @@ try:
 except Exception:      # pragma: no cover — HUD must never die over cosmetics
     HoloAvatar = None
 
+try:
+    # Whether the security scanner is installed. Read once at import for the
+    # header button's enabled state; the bridge is the source of truth.
+    from core.deep_eye import available as deep_eye_available
+except Exception:      # pragma: no cover
+    def deep_eye_available() -> bool:
+        return False
+
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -3274,6 +3282,12 @@ class MainWindow(QMainWindow):
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
     _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
+    # ── Deep Eye: the scanner's reader thread emits these ────────────────────
+    _de_begin_sig    = pyqtSignal(str)       # target about to be scanned
+    _de_line_sig     = pyqtSignal(str)       # one line of scanner output
+    _de_done_sig     = pyqtSignal(bool, str)  # (ok, spoken summary)
+    _de_findings_sig = pyqtSignal(str)       # rendered counts for the panel
+    _de_activity_sig = pyqtSignal(str)       # short text for the avatar
     _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
     _cam_frame_sig  = pyqtSignal(bytes)      # live camera frame → HUD area
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
@@ -3433,6 +3447,15 @@ class MainWindow(QMainWindow):
         self._log_sig.connect(self._log.append_log)
         self._log_sig.connect(self._append_activity)
         self._state_sig.connect(self._apply_state)
+        # Deep Eye: the panel may not exist yet — the header button creates it
+        # on first click. The handlers create it on demand rather than dropping
+        # output, because a scan started by voice must show progress even if
+        # the user never pressed the button.
+        self._de_begin_sig.connect(self._de_on_begin)
+        self._de_line_sig.connect(self._de_on_line)
+        self._de_done_sig.connect(self._de_on_done)
+        self._de_findings_sig.connect(self._de_on_findings)
+        self._de_activity_sig.connect(self._de_on_activity)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
         self._camera_sig.connect(self._show_camera_frame)
@@ -4043,11 +4066,45 @@ class MainWindow(QMainWindow):
         lay.addStretch()
 
         right_col = QVBoxLayout(); right_col.setSpacing(2)
+        # Deep Eye sits immediately left of the clock, in the corner the eye
+        # naturally goes to. A compact target glyph rather than a word: the
+        # header is already tight, and the tooltip carries the explanation.
+        self._deep_eye_btn = QPushButton("◎")
+        self._deep_eye_btn.setFixedSize(22, 22)
+        self._deep_eye_btn.setFont(QFont("Courier New", 9))
+        self._deep_eye_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._deep_eye_btn.setToolTip(
+            "Deep Eye — security scanner.\n"
+            "Audits a site you own for vulnerabilities.\n"
+            "Asks for confirmation before any scan.")
+        self._deep_eye_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.TEXT_DIM};
+                border: 1px solid {C.BORDER}; border-radius: 10px;
+            }}
+            QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}
+            QPushButton:checked {{
+                color: {C.PRI}; border-color: {C.PRI}; background: {C.PRI_GHO};
+            }}
+        """)
+        self._deep_eye_btn.setCheckable(True)
+        self._deep_eye_btn.clicked.connect(self._toggle_deep_eye)
+        # A dead button is worse than no button: if the scanner is not
+        # installed, say so on hover instead of letting a click fail silently.
+        if not deep_eye_available():
+            self._deep_eye_btn.setEnabled(False)
+            self._deep_eye_btn.setToolTip(
+                "Deep Eye is not installed.\n"
+                "Run scripts/install.ps1 in vendor/deep-eye, then restart.")
+        top_row = QHBoxLayout(); top_row.setSpacing(6)
+        top_row.addStretch()
+        top_row.addWidget(self._deep_eye_btn)
         self._clock_lbl = QLabel("00:00:00")
         self._clock_lbl.setFont(QFont("Courier New", 14, QFont.Weight.Bold))
         self._clock_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         self._clock_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        right_col.addWidget(self._clock_lbl)
+        top_row.addWidget(self._clock_lbl)
+        right_col.addLayout(top_row)
         self._date_lbl = QLabel("")
         self._date_lbl.setFont(QFont("Courier New", 7))
         self._date_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
@@ -4469,6 +4526,113 @@ class MainWindow(QMainWindow):
             self._quick_drawer.raise_()
         else:
             self._quick_drawer.hide()
+
+    def _toggle_deep_eye(self, checked: bool) -> None:
+        """Open or close the security-scan panel.
+
+        Opening the panel does NOT start a scan. A scan is an active attack
+        against a third-party server; it begins only through the confirmation
+        gate, whether it came from this button or from the voice tool. If it
+        were wired to the click, a single stray click would start hitting
+        somebody's website.
+        """
+        if not checked:
+            panel = getattr(self, "_de_panel", None)
+            if panel is not None:
+                panel.close_panel()
+            return
+        panel = getattr(self, "_de_panel", None)
+        if panel is None:
+            from ui_deep_eye import DeepEyePanel
+            panel = DeepEyePanel(self)
+            panel.on_stop = self.on_deep_eye_stop
+            self._de_panel = panel
+        self._position_deep_eye(panel)
+        panel.show()
+        panel.raise_()
+
+    def _position_deep_eye(self, panel) -> None:
+        """Centre the panel over the HUD.
+
+        Centred, not top-left: the user is looking at the assistant's face, and
+        an overlay that covers the thing they are talking to reads as a modal —
+        which, for a panel that can stop a running scan, is roughly right.
+        """
+        host = self.centralWidget()
+        panel.adjustSize()
+        w = min(panel.width(), int(host.width() * 0.8))
+        h = min(panel.height(), int(host.height() * 0.8))
+        panel.setFixedSize(max(w, 380), max(h, 260))
+        panel.move((host.width() - panel.width()) // 2,
+                   (host.height() - panel.height()) // 2)
+
+    def on_deep_eye_stop(self) -> None:
+        """Asked by the panel's STOP button. JarvisLive sets the real handler."""
+        cb = getattr(self, "on_deep_eye_cancel", None)
+        if callable(cb):
+            try:
+                cb()
+            except Exception:
+                pass
+
+    # ── Deep Eye: signal handlers ───────────────────────────────────────────
+    # All of these run on the Qt thread (they are signal slots), which is the
+    # only place widgets may be touched. None of them may raise: a slot that
+    # throws inside a signal emission prints to stderr and leaves the widget in
+    # whatever half-updated state it reached, and the next line of output then
+    # lands on top of it.
+
+    def _de_panel_or_none(self):
+        return getattr(self, "_de_panel", None)
+
+    def _de_on_begin(self, target: str) -> None:
+        try:
+            panel = self._de_panel_or_none()
+            if panel is None:
+                return
+            panel.begin(target)
+            btn = getattr(self, "_deep_eye_btn", None)
+            if btn is not None:
+                btn.setChecked(True)
+        except Exception:
+            pass
+
+    def _de_on_line(self, line: str) -> None:
+        try:
+            panel = self._de_panel_or_none()
+            if panel is not None:
+                panel.append_line(line)
+        except Exception:
+            pass
+
+    def _de_on_done(self, ok: bool, message: str) -> None:
+        try:
+            panel = self._de_panel_or_none()
+            if panel is not None:
+                panel.end(ok, message)
+        except Exception:
+            pass
+
+    def _de_on_findings(self, text: str) -> None:
+        try:
+            panel = self._de_panel_or_none()
+            if panel is not None:
+                panel._verdict.setText(text)
+                panel._verdict.setVisible(True)
+        except Exception:
+            pass
+
+    def _de_on_activity(self, text: str) -> None:
+        """The avatar's own line, so a scan is visible with the panel closed.
+
+        A scan takes minutes. If the only feedback lived in a panel the user
+        never opened, the button would look broken and the honest response
+        would be to press it again — starting a second scan.
+        """
+        try:
+            self.hud.activity = text or ""
+        except Exception:
+            pass
 
     def _position_quick_drawer(self):
         if not hasattr(self, '_quick_drawer'):
@@ -6099,6 +6263,28 @@ class JarvisUI:
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
+
+    # ── Deep Eye panel ──────────────────────────────────────────────────────
+    # Signals, not direct calls. The scanner's reader runs on its own thread
+    # and a scan runs for minutes; touching a widget from there is a crash,
+    # not a warning. Each of these is emitted from that thread and delivered
+    # on the Qt thread by the signal machinery.
+    def deep_eye_begin(self, target: str):
+        self._win._de_begin_sig.emit(target)
+
+    def deep_eye_line(self, line: str):
+        self._win._de_line_sig.emit(line)
+
+    def deep_eye_done(self, ok: bool, message: str):
+        self._win._de_done_sig.emit(ok, message)
+
+    def deep_eye_findings(self, summary_text: str):
+        self._win._de_findings_sig.emit(summary_text)
+
+    def deep_eye_activity(self, text: str):
+        """Shown on the avatar itself, so a scan is visible even with the
+        panel closed — otherwise the button appears to do nothing."""
+        self._win._de_activity_sig.emit(text)
 
     def wait_for_api_key(self):
         while not self._win._ready:
