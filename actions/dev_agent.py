@@ -283,9 +283,11 @@ def _open_vscode(project_dir: Path) -> bool:
     ]
     for cmd in vscode_candidates:
         try:
+            # argv list, no shell: the path is ours but the argument is a
+            # user-supplied project dir, and shell=True would let a directory
+            # name containing shell metacharacters become a command.
             subprocess.Popen(
                 [cmd, str(project_dir)],
-                shell=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )

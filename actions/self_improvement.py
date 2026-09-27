@@ -21,7 +21,58 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Import system dependencies
 from doctor import Doctor
 from core import gemini
+from core import confirm
 from core.execution_logger import get_action_stats, get_recent_failures
+
+# Traceback signatures we are willing to hand a code model. A broad match here
+# would let a wrong failure rewrite an unrelated file, so the list is short and
+# explicit rather than "anything that looks like a crash".
+_AUTO_FIXABLE = ("SyntaxError", "TypeError", "NameError")
+
+
+def _autofix_target(failures: list[dict]) -> Optional[str]:
+    """Return the action filename a repair could safely target, or None.
+
+    The name comes from telemetry, so it is never trusted as a path: it is
+    rejected unless it is a plain module name that resolves to a real file
+    inside actions/. That closes the traversal a crafted action_name
+    ('../../core/gemini') would otherwise open.
+    """
+    for f in failures or []:
+        tb = str(f.get("traceback") or "")
+        raw = str(f.get("action_name") or "").strip()
+        if not any(sig in tb for sig in _AUTO_FIXABLE) or not raw:
+            continue
+        if not raw.replace("_", "").isalnum():      # no dots, slashes, colons
+            continue
+        if not (BASE_DIR / "actions" / f"{raw}.py").is_file():
+            continue
+        return raw
+    return None
+
+
+def _autofix_run(action_name: str) -> str:
+    """Hand one action file to dev_agent, after the user confirmed on the HUD."""
+    import shutil
+    from datetime import datetime as _dt
+
+    src = BASE_DIR / "actions" / f"{action_name}.py"
+    backup_dir = BASE_DIR / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup = backup_dir / f"{action_name}.py.{_dt.now():%Y%m%d-%H%M%S}.bak"
+    shutil.copy2(src, backup)
+
+    from actions import dev_agent
+    return dev_agent.dev_agent(
+        parameters={
+            "description": (
+                f"Repair the single file {src}. It raises on this failure: "
+                f"see {backup}. Change nothing else, add no new features, and "
+                f"return the corrected full contents of that one file."
+            ),
+            "language": "python",
+        }
+    )
 
 
 def _run_doctor_captured() -> dict:
@@ -71,7 +122,9 @@ def run_self_audit(parameters: Optional[Dict[str, Any]] = None, **kwargs) -> str
     Core handler for self-improvement and diagnostic audit.
     """
     params = parameters or {}
-    auto_fix = params.get("auto_fix", True)
+    # Off by default: the report is safe to generate unattended, rewriting the
+    # app's own source is not. See the SAFETY note at the repair block below.
+    auto_fix = bool(params.get("auto_fix", False))
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     date_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -144,20 +197,49 @@ health_failures: {doctor_res['failures']}
     obsidian_file = _save_to_obsidian_vault(full_obsidian_note, date_str)
 
     # 5. Attempt Autonomous Fix via dev_agent if requested & failures exist
+    #
+    # SAFETY (2026-09-27): this used to default auto_fix to True, which let the
+    # model rewrite JARVIS's own source in actions/ with nobody watching. Two
+    # changes, both deliberate:
+    #
+    #   1. auto_fix now defaults to False. The report always contains the fix
+    #      plan; applying it is a separate, human-initiated step.
+    #   2. Even when requested, the repair is parked behind core/confirm.py —
+    #      the same gate that guards shutdown — so the token that approves it is
+    #      issued by the HUD, never by the model. Without a bound interface
+    #      confirm.request() refuses, which is the correct failure direction.
+    #
+    # The step is ALSO a no-op by design below: dev_agent only BUILDS projects,
+    # it has no "repair this existing file" entry point, so the old code imported
+    # it and then never called it. The gate is kept because the real wiring is a
+    # one-line change once dev_agent grows a repair path.
     autofix_summary = ""
     if auto_fix and failures:
-        try:
-            from actions import dev_agent
-            # Identify first python action file with failure traceback
-            for f in failures:
-                tb = f.get("traceback") or ""
-                act_name = f.get("action_name") or ""
-                target_file = BASE_DIR / "actions" / f"{act_name}.py"
-                if target_file.exists() and ("SyntaxError" in tb or "TypeError" in tb or "NameError" in tb):
-                    autofix_summary = f"\n- Invoked dev_agent to attempt self-repair on `actions/{act_name}.py`."
-                    break
-        except Exception as exc:
-            autofix_summary = f"\n- Self-repair attempt skipped: {exc}"
+        pending = confirm.pending_title()
+        if pending:
+            autofix_summary = (
+                f"\n- Self-repair NOT started: another confirmation is already "
+                f"waiting on screen ({pending}).")
+        else:
+            target = _autofix_target(failures)
+            if target is None:
+                autofix_summary = ("\n- Self-repair NOT started: no auto-fixable "
+                                   "failure found (needs a SyntaxError, TypeError "
+                                   "or NameError traceback in an action).")
+            else:
+                autofix_summary = confirm.request(
+                    key="self-repair",
+                    title="Let JARVIS rewrite one of its own action files?",
+                    detail=(f"Target: actions/{target}\n\n"
+                            f"The audit found a repairable crash here. If you "
+                            f"confirm, JARVIS will hand the file to dev_agent "
+                            f"and let it rewrite the code. A copy is kept in "
+                            f"backups/ so you can restore it."),
+                    run=lambda f=target: _autofix_run(f),
+                )
+    elif not auto_fix:
+        autofix_summary = ("\n- Self-repair skipped (auto_fix is off by default). "
+                           "The fix plan is in the report; ask for it to be applied.")
 
     # 6. Save to Long Term Memory if available
     try:
@@ -181,13 +263,17 @@ health_failures: {doctor_res['failures']}
 
 TOOL = {
     "name": "run_self_audit",
-    "description": "Run a self-diagnostic audit on JARVIS. Analyzes failed tasks, checks system health with doctor.py, writes a detailed audit note & copy-pasteable fix plan to Obsidian, and attempts auto-fixing code bugs.",
+    "description": "Run a self-diagnostic audit on JARVIS. Analyzes failed tasks, checks system health with doctor.py, writes a detailed audit note & copy-pasteable fix plan to Obsidian. Never modifies code unless the user explicitly asks AND confirms on the HUD.",
     "parameters": {
+        # "OBJECT"/"BOOLEAN" in caps: that is core/action_loader.py's own
+        # contract, not JSON Schema. Lowercase here makes the loader reject the
+        # whole action at startup.
         "type": "OBJECT",
         "properties": {
             "auto_fix": {
                 "type": "BOOLEAN",
-                "description": "If True, JARVIS will attempt autonomous code fixes for detected action bugs using dev_agent."
+                "default": False,
+                "description": "Optional. Leave false unless the user explicitly asked you to repair a broken action. If true, JARVIS will ASK THE USER ON THE HUD to confirm before letting dev_agent rewrite one action file. Do not set this on your own initiative."
             }
         },
     },

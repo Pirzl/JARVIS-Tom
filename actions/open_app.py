@@ -2,6 +2,7 @@ import time
 import subprocess
 import platform
 import shutil
+import os
 
 try:
     import psutil
@@ -81,9 +82,12 @@ def _launch_windows(app_name: str) -> bool:
 
     if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
         try:
+            # which() already proved this resolves to a real executable on
+            # PATH, but shell=True would still hand it to cmd.exe. The resolved
+            # path is passed as argv[0] instead, with no shell in between.
+            exe = shutil.which(app_name) or shutil.which(app_name.split(".")[0])
             subprocess.Popen(
-                app_name,
-                shell=True,
+                [exe],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -93,8 +97,13 @@ def _launch_windows(app_name: str) -> bool:
             print(f"[open_app] subprocess failed: {e}")
 
     if ":" in app_name:
+        # argv list, never a shell string: app_name comes from a spoken
+        # request, so `start <name>` built with an f-string let anything
+        # after the colon run as a separate command (`notepad: & del ...`).
+        # os.startfile takes the target as a single argument, which is what
+        # "start" does anyway for a path or URI.
         try:
-            subprocess.Popen(f"start {app_name}", shell=True)
+            os.startfile(app_name)          # noqa: S606 - Windows shell API, no shell
             time.sleep(1.0)
             return True
         except Exception:
