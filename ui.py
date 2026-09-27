@@ -47,6 +47,15 @@ except Exception:      # pragma: no cover
     def deep_eye_available() -> bool:
         return False
 
+try:
+    # Whether the live-globe app is installed (vendor checkout + node_modules).
+    # Same reasoning: the button's enabled state is decided once, here, so a
+    # click never has to discover a missing install and fail silently.
+    from ui_world_view import available as world_view_available
+except Exception:      # pragma: no cover
+    def world_view_available() -> bool:
+        return False
+
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -4098,6 +4107,39 @@ class MainWindow(QMainWindow):
                 "Run scripts/install.ps1 in vendor/deep-eye, then restart.")
         top_row = QHBoxLayout(); top_row.setSpacing(6)
         top_row.addStretch()
+        # World View sits left of Deep Eye. Same compact-glyph treatment: the
+        # header is tight, and the tooltip carries the explanation. The glyph
+        # is a globe rather than an eye so the two buttons stay distinguishable
+        # at 22 px.
+        self._world_btn = QPushButton("⊕")
+        self._world_btn.setFixedSize(22, 22)
+        self._world_btn.setFont(QFont("Courier New", 9))
+        self._world_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._world_btn.setToolTip(
+            "World View — live globe.\n"
+            "Satellite imagery, aircraft, vessels and traffic\n"
+            "from public feeds. Runs on this machine only.")
+        self._world_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.TEXT_DIM};
+                border: 1px solid {C.BORDER}; border-radius: 10px;
+            }}
+            QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}
+            QPushButton:checked {{
+                color: {C.PRI}; border-color: {C.PRI}; background: {C.PRI_GHO};
+            }}
+        """)
+        self._world_btn.setCheckable(True)
+        self._world_btn.clicked.connect(self._toggle_world_view)
+        # Same reasoning as Deep Eye: a button that cannot work must say why on
+        # hover, not fail on click.
+        if not world_view_available():
+            self._world_btn.setEnabled(False)
+            self._world_btn.setToolTip(
+                "World View is not installed.\n"
+                "Run scripts/install_world_view.sh, then restart.")
+        self._world_panel = None
+        top_row.addWidget(self._world_btn)
         top_row.addWidget(self._deep_eye_btn)
         self._clock_lbl = QLabel("00:00:00")
         self._clock_lbl.setFont(QFont("Courier New", 14, QFont.Weight.Bold))
@@ -4566,6 +4608,45 @@ class MainWindow(QMainWindow):
             panel.reset()
         panel.show()
         panel.raise_()
+
+    def _toggle_world_view(self, checked: bool) -> None:
+        """Open or close the live-globe window.
+
+        Opening the window does start the Globe's dev server, because unlike a
+        security scan that is not an action against a third party: it launches
+        a local process that serves a map. The cost is real though (a cold
+        start is around twenty seconds), so the status line says "starting"
+        immediately rather than leaving a blank window that looks broken.
+
+        A separate top-level window rather than an overlay: a live globe was
+        measured producing worst-case gaps of ~109 ms in Qt's event loop, and
+        the HUD is where the voice and the avatar live. Keeping it out of the
+        main window means those spikes cannot reach them.
+        """
+        if not checked:
+            # Closing the view is not a request to shut the server down: the
+            # globe takes twenty seconds to come back, and the user may just
+            # be tidying up. STOP SERVER is the explicit control for that.
+            if self._world_panel is not None:
+                self._world_panel.hide()
+            return
+
+        from ui_world_view import GlobePanel
+
+        if self._world_panel is None:
+            self._world_panel = GlobePanel()
+        panel = self._world_panel
+        panel.show()
+        panel.raise_()
+        panel.activateWindow()
+        if panel.is_running():
+            # Already up: just point the view at it.
+            panel.ensure_view()
+        else:
+            # Not up. Start it in the background -- a cold start is about
+            # twenty seconds and blocking here would freeze the HUD for all of
+            # it. The panel creates the view itself once the port answers.
+            panel.start_server_async()
 
     def _position_deep_eye(self, panel) -> None:
         """Centre the panel over the HUD.
@@ -6146,6 +6227,14 @@ class _RootShim:
 
 class JarvisUI:
     def __init__(self, face_path: str, size=None):
+        # QtWebEngine (the World View globe) shares its GL contexts through this
+        # attribute, and it must be set BEFORE the QApplication exists. Miss it
+        # and the WebEngine render process dies the first time a page asks for a
+        # GPU context -- silently, with no traceback, so the failure looks like
+        # an unrelated crash. Setting it unconditionally is harmless when the
+        # globe is never opened.
+        QApplication.setAttribute(
+            Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
         self._win = MainWindow(face_path)
