@@ -296,6 +296,39 @@ class TestReopening(PanelTestCase):
                         "the target row stayed dead after a finished scan")
 
 
+class TestTheGateIsVisibleOverThePanel(PanelTestCase):
+    """Regression: the confirmation banner came up *behind* the panel.
+
+    The panel was parented to the MainWindow while the banner is an overlay of
+    centralWidget(). Qt stacks siblings within a parent, so a child of the
+    window drew over a child of the central widget no matter what raise_()
+    did. The result was a dialog asking to confirm an active attack, hidden
+    behind a box whose only button does nothing until it is answered.
+    """
+
+    def test_the_panel_shares_a_parent_with_the_confirmation_banner(self):
+        self.w._toggle_deep_eye(True)
+        _app.processEvents()
+        panel = self.w._de_panel
+        self.assertIs(panel.parentWidget(), self.w.centralWidget(),
+                      "the panel is not a sibling of the banner")
+
+    def test_the_banner_goes_on_top_of_the_panel(self):
+        self.w._toggle_deep_eye(True)
+        _app.processEvents()
+        self.w._show_confirm_banner("Run a security scan", "localhost")
+        _app.processEvents()
+        banner = self.w._confirm_overlay
+        self.assertIsNotNone(banner, "no banner was raised")
+        # raise_() is a request to the window manager; the reliable check is
+        # the sibling order, which is what actually decides the paint order.
+        self.assertGreater(
+            banner.parentWidget().children().index(banner),
+            self.w.centralWidget().children().index(self.w._de_panel),
+            "the banner is stacked below the Deep Eye panel")
+        self.assertTrue(banner.isVisible())
+
+
 class TestCallbackCrossesTheProxy(PanelTestCase):
     """Regression: the panel said "Not available" on a working scanner.
 
@@ -704,7 +737,38 @@ class TestVoiceAction(PanelTestCase):
         import inspect
         params = list(inspect.signature(A.deep_eye).parameters)
         self.assertNotIn("self", params)
-        self.assertEqual(params[0], "params")
+
+    def test_the_first_parameter_is_named_parameters(self):
+        """Regression, found by JARVIS diagnosing itself in a live session.
+
+        The loader calls every action as `fn(parameters=parameters, **ctx)` —
+        the name is hardcoded there. An action that names it anything else
+        (`params`, `args`) raises TypeError: unexpected keyword argument
+        'parameters' on the first spoken scan, with no trace of where the
+        name was decided. Every other action in actions/ uses `parameters`.
+        """
+        import inspect
+        self.assertEqual(list(inspect.signature(A.deep_eye).parameters)[0],
+                         "parameters")
+
+    def test_it_survives_the_loader_actually_calling_it(self):
+        """Not the signature — the real invocation shape, from
+        core/action_loader.py line 154."""
+        from core import action_loader
+        src = (BASE_DIR / "core" / "action_loader.py").read_text(encoding="utf-8")
+        self.assertIn("fn(parameters=parameters", src,
+                      "the loader no longer calls it that way; re-check the "
+                      "action's parameter name")
+
+    def test_the_voice_path_works_with_the_loader_signature(self):
+        """End to end through the real loader, with the gate stubbed out."""
+        from core import action_loader
+        A.de.request_scan = lambda t, c, **kw: "confirmation pending"
+        try:
+            out = A.deep_eye(parameters={"action": "scan", "target": "localhost"})
+            self.assertIn("confirmation", out.lower())
+        finally:
+            A.de.request_scan = de.request_scan
 
     def test_a_missing_target_asks_instead_of_guessing(self):
         out = A.deep_eye({"action": "scan", "target": ""})

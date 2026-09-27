@@ -139,9 +139,12 @@ class TestVoiceReachesTheGate(TestAssembly):
         self.assertEqual(self.seen.get("target"), "localhost")
 
     def test_the_handler_signature_is_loader_shaped(self):
+        """The loader calls fn(parameters=parameters, **ctx). Both halves of
+        that matter: the keyword name is hardcoded, so a differently-named
+        first parameter is a TypeError on the first spoken scan."""
         params = list(inspect.signature(A.deep_eye).parameters)
         self.assertNotIn("self", params)
-        self.assertEqual(params, ["params", "speak"])
+        self.assertEqual(params, ["parameters", "speak"])
 
     def test_nothing_starts_a_scan_without_the_gate(self):
         """Belt and braces: across this whole file, no test may reach

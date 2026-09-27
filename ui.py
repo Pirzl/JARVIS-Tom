@@ -4544,7 +4544,13 @@ class MainWindow(QMainWindow):
         panel = getattr(self, "_de_panel", None)
         if panel is None:
             from ui_deep_eye import DeepEyePanel
-            panel = DeepEyePanel(self)
+            # Parent on centralWidget(), not on self. The confirmation banner
+            # is an overlay of centralWidget(), and Qt stacks siblings by
+            # parent: a panel parented to the window drew *over* the banner,
+            # so confirming a scan meant looking at a box with a dead SCAN
+            # button and a question hidden behind it. Same parent as the
+            # overlay, so raise_() decides the order.
+            panel = DeepEyePanel(self.centralWidget())
             panel.on_stop = self.on_deep_eye_stop
             # SCAN in the panel is a request, not a command. It goes to the
             # same gate as the voice path, so a click can never start a scan
@@ -4569,6 +4575,7 @@ class MainWindow(QMainWindow):
         which, for a panel that can stop a running scan, is roughly right.
         """
         host = self.centralWidget()
+        panel.setParent(host)
         panel.adjustSize()
         w = min(panel.width(), int(host.width() * 0.8))
         h = min(panel.height(), int(host.height() * 0.8))
@@ -5931,6 +5938,15 @@ class MainWindow(QMainWindow):
         ov.answered.connect(self._on_confirm_answered)
         self._centre_overlay(ov)
         self._confirm_overlay = ov
+        # The Deep Eye panel is also an overlay of centralWidget(). Whatever
+        # opened the gate must sit on top of whatever asked for it, or the
+        # question is hidden behind the box that raised it — and the only
+        # visible controls are ones that do nothing until it is answered.
+        panel = getattr(self, "_de_panel", None)
+        if panel is not None and panel.isVisible():
+            panel.lower()
+        ov.raise_()
+        ov.setFocus()
 
     def _hide_confirm_banner(self):
         ov = getattr(self, "_confirm_overlay", None)

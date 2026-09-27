@@ -67,15 +67,15 @@ def _open_panel() -> None:
         pass
 
 
-def deep_eye(params: dict, speak=None) -> str:
+def deep_eye(parameters: dict, speak=None) -> str:
     """Entry point for the `deep_eye` tool.
 
     `speak` is injected by the action loader and used only for the spoken
     summary; the confirmation banner is raised by core/confirm, which is
     already bound to the HUD at startup.
     """
-    action = str(params.get("action", "scan")).strip().lower()
-    target = str(params.get("target", "")).strip()
+    action = str(parameters.get("action", "scan")).strip().lower()
+    target = str(parameters.get("target", "")).strip()
 
     if action == "status":
         return _status()
