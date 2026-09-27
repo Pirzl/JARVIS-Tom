@@ -11,6 +11,21 @@
 # software with QPainter and posed with numpy, so the face costs no extra
 # package, no OpenGL and no GPU. Nothing below was added for it.
 PyQt6>=6.6,<7
+# QtWebEngine is a second, much larger binary package (~132 MB, not the ~0.3 MB
+# the PyPI page suggests -- that figure is only the thin wheel) and it is NOT
+# installed by `pip install PyQt6`. Without it the globe panel cannot exist, so
+# it is declared here rather than left as a manual step. It must stay on the
+# same minor version as PyQt6: 6.11.x is built against Qt 6.11.2, and mixing
+# it with a different PyQt6 minor produces a WebEngine process that dies
+# silently the moment a page asks for a GPU context.
+#
+# Two requirements are not obvious and cost real time to find:
+#   * Qt.ApplicationAttribute.AA_ShareOpenGLContexts must be set BEFORE the
+#     QApplication is constructed, or WebGL content kills the render process
+#     with no traceback.
+#   * runJavaScript never calls back in this build even though pages load
+#     normally, so the Qt<->JS bridge must use QWebChannel, not futures.
+PyQt6-WebEngine>=6.11,<6.12
 sounddevice>=0.4,<1
 numpy>=1.24,<3
 google-genai>=2.8.0,<3
