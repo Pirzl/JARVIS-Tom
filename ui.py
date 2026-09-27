@@ -4269,6 +4269,21 @@ class MainWindow(QMainWindow):
             }}
             QPushButton:hover {{ color: {C.PRI}; border-color: {C.BORDER_B}; }}
         """
+        # The listening-window buttons need their own style: they are small, and
+        # inheriting the dim style's `text-align: left` plus a default
+        # foreground left them rendering as unreadable dark-on-dark boxes.
+        _WAKE_TIMEOUT_STYLE = f"""
+            QPushButton {{
+                background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+                text-align: center; padding: 0 4px;
+            }}
+            QPushButton:hover {{ color: {C.PRI}; border-color: {C.BORDER_B}; }}
+            QPushButton:checked {{
+                background: {C.GREEN_D}; color: {C.GREEN};
+                border: 1px solid {C.GREEN};
+            }}
+        """
 
         w = QWidget(self.centralWidget())
         w.setObjectName("QuickDrawer")
@@ -4362,20 +4377,29 @@ class MainWindow(QMainWindow):
         # The listening window is the single most annoying thing to get
         # wrong by default: too long and the assistant keeps answering a room
         # it was never addressed to, too short and you have to repeat yourself.
-        # Three buttons plus "never" rather than a spinner, because the useful
-        # values are a handful and one click beats a drag.
+        #
+        # Laid out as ONE row, not a column. Stacked, four more 26px rows made
+        # the drawer taller than the space it opens into, so they were clipped
+        # to blank rectangles — buttons that exist, work, and cannot be read.
+        # A minimum width keeps each label legible; the row stays inside the
+        # 220px drawer because 4 x 47px + spacing fits.
         self._wake_timeout_btns = []
-        for label, seconds in (("10s", 10), ("20s", 20), ("30s", 30), ("∞", 0)):
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        for label, seconds in (("10s", 10), ("20s", 20), ("30s", 30), ("OFF", 0)):
             b = QPushButton(label)
             b.setFixedHeight(26)
+            b.setMinimumWidth(38)
             b.setFont(QFont("Courier New", 7))
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setCheckable(True)
+            b.setStyleSheet(_WAKE_TIMEOUT_STYLE)
             b.clicked.connect(
                 lambda _checked=False, s=seconds: self._set_wake_timeout(s))
             b.hide()
-            lay.addWidget(b)
+            row.addWidget(b)
             self._wake_timeout_btns.append((b, seconds))
+        lay.addLayout(row)
 
         self._ptt_btn = QPushButton()
         self._ptt_btn.setFixedHeight(26)
