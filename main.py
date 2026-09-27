@@ -72,7 +72,7 @@ from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
-    get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
+    get_wake_sleep_timeout, get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
 )
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
@@ -89,6 +89,12 @@ from core.wake_word            import (
 
 # How long the assistant stays awake with no user speech before it auto-sleeps
 # again (wake-word mode only).
+#
+# The value below is only the FALLBACK: a per-install "wake_sleep_timeout"
+# in config/api_keys.json overrides it, so the silence window can be changed
+# without editing code. 0.0 means "never auto-sleep" — the assistant stays
+# awake until you put it to sleep yourself, which is the right setting when
+# the mic is far away and waking it by hand is impractical.
 WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
 
 def get_base_dir():
@@ -678,7 +684,7 @@ class JarvisLive(LiveConfigMixin, BackgroundLoopsMixin):
         self._wake_enabled     = get_wake_word_enabled()
         self._awake            = not self._wake_enabled
         self._wake_detector: WakeWordDetector | None = None
-        self._wake_sleep_timeout = WAKE_SLEEP_TIMEOUT
+        self._wake_sleep_timeout = get_wake_sleep_timeout()
 
         # Restore the saved push-to-talk preference. Doing it here rather than
         # in __init__ means the hotkey thread only exists once there is a
@@ -749,17 +755,26 @@ class JarvisLive(LiveConfigMixin, BackgroundLoopsMixin):
         self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey Jarvis' to wake me.")
 
     async def _run_sleep_watch(self) -> None:
-        """Auto-sleep after the configured silence window (wake-word mode only)."""
+        """Auto-sleep after the configured silence window (wake-word mode only).
+
+        A window of 0 means "stay awake", so the check is skipped entirely —
+        without it, `elapsed > 0` is true on the very first tick and the
+        assistant would fall asleep instantly.
+        """
         while True:
             await asyncio.sleep(5)
             if not self._wake_enabled or not self._awake:
+                continue
+            if self._wake_sleep_timeout <= 0:
                 continue
             with self._speaking_lock:
                 speaking = self._is_speaking
             if speaking:
                 continue
             if (time.monotonic() - self._last_user_speech) > self._wake_sleep_timeout:
-                self.sleep(reason="no speech for 2 minutes")
+                mins = round(self._wake_sleep_timeout / 60.0)
+                when = f"{mins} minutes" if mins >= 1 else f"{self._wake_sleep_timeout:g} seconds"
+                self.sleep(reason=f"no speech for {when}")
 
     # ── Wake word: UI callbacks (called from the Qt thread) ──────────────────
 

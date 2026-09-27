@@ -60,13 +60,18 @@ pywin32;    sys_platform == "win32"
 wmi;        sys_platform == "win32"
 
 # ── Test suite ───────────────────────────────────────────────────────────────
-# Not needed to RUN the assistant — only to run `pytest` over tests/. Install
-# it with:  pip install pytest    (or: python -m pytest -q)
-#
-# The suite is plain unittest, so `python -m unittest discover -s tests` also
-# works with no extra package at all. pytest is here because it gives the
-# per-test reporting and the subtest output the regression tests rely on.
+# Not needed to RUN the assistant — only to run `pytest` over tests/.
+# The suite is plain unittest, so `python -m unittest discover -s tests` works
+# with no extra package; pytest adds per-test reporting and subtest output.
 pytest>=8,<10
+
+# ── Local wake word ("Hey Jarvis") ───────────────────────────────────────────
+# Deliberately NOT installed by default upstream — it is opt-in because the
+# models are a one-time download and the feature is not everyone's use. This
+# install has it enabled (config: wake_word_enabled=true), so it is now a real
+# requirement rather than an extra. One-click setup remains in the app:
+# ⚙ → WAKE WORD, or  core/wake_word.install_and_download().
+openwakeword>=0.6,<1
 
 # ── Documents, media & hardware readouts ──────────────────────────────────────
 # Every one of these is imported inside a try/except at the point of use, so a

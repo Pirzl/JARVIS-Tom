@@ -55,35 +55,55 @@ class TestExtractionShape(unittest.TestCase):
 
 
 class TestMovedCodeIsUnchanged(unittest.TestCase):
-    """The strongest guarantee available: compare against the pre-extraction
-    source straight out of git, ignoring indentation."""
+    """The strongest guarantee available: compare the moved methods against
+    the commit that still held them.
+
+    The reference is NOT `HEAD` — after the extraction is committed, HEAD's
+    main.py no longer contains these methods, so comparing against it would
+    fail on a correct tree. Instead the file is found by searching history for
+    the last commit whose main.py still defines them, and that snapshot is
+    frozen as the reference. Comparing AST (not lines) ignores the indentation
+    the move introduced, so any real edit shows up.
+    """
 
     @classmethod
     def setUpClass(cls):
-        cls.have_git = (BASE_DIR / ".git").is_dir()
-        if cls.have_git:
-            r = subprocess.run(["git", "show", "HEAD:main.py"], cwd=BASE_DIR,
-                               capture_output=True, text=True)
-            cls.orig = r.stdout if r.returncode == 0 else ""
-        else:
-            cls.orig = ""
         cls.moved = (BASE_DIR / "core" / "background_loops.py").read_text(
             encoding="utf-8")
 
-    def test_all_five_present_in_both(self):
-        self.assertEqual(len(METHODS), 5)
-        self.assertTrue(all(m in self.moved for m in METHODS))
+    def _last_main_py_with_methods(self):
+        """Newest commit whose main.py still defines all five methods."""
+        import subprocess
+        commits = subprocess.run(
+            ["git", "log", "--format=%H", "--", "main.py"],
+            cwd=BASE_DIR, capture_output=True, text=True).stdout.split()
+        for sha in commits:
+            src = subprocess.run(["git", "show", f"{sha}:main.py"], cwd=BASE_DIR,
+                                 capture_output=True, text=True).stdout
+            if not src:
+                continue
+            try:
+                found = _methods_of(src, "JarvisLive")
+            except SyntaxError:
+                continue
+            if all(m in found for m in METHODS):
+                return src
+        return ""
 
-    @unittest.skipUnless(True, "compared against git history")
-    def test_bodies_match_git_history_ast(self):
-        if not self.orig:
-            self.skipTest("no git history available")
-        before = _methods_of(self.orig, "JarvisLive")
+    def test_all_five_present_in_the_mixin(self):
+        found = _methods_of(self.moved, "BackgroundLoopsMixin")
+        for name in METHODS:
+            self.assertIn(name, found, f"{name} is missing from the mixin")
+
+    def test_bodies_match_the_last_containing_version(self):
+        ref = self._last_main_py_with_methods()
+        if not ref:
+            self.skipTest("no commit whose main.py still holds these methods")
+        before = _methods_of(ref, "JarvisLive")
         after = _methods_of(self.moved, "BackgroundLoopsMixin")
         for name in METHODS:
             with self.subTest(method=name):
-                self.assertIn(name, before, f"{name} was not in main.py at HEAD")
-                self.assertIn(name, after, f"{name} is missing from the mixin")
+                self.assertIn(name, before)
                 self.assertEqual(
                     ast.dump(before[name], include_attributes=False),
                     ast.dump(after[name], include_attributes=False),

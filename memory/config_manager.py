@@ -12,6 +12,12 @@ CONFIG_DIR  = BASE_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "api_keys.json"
 CONFIG_VERSION = 1
 
+# Fallback silence window, used when config/api_keys.json carries no
+# "wake_sleep_timeout". Mirrors main.WAKE_SLEEP_TIMEOUT, which stays the
+# documented default; this constant is only here so config_manager does not
+# have to import main (which imports it).
+DEFAULT_WAKE_SLEEP_TIMEOUT = 120.0
+
 
 def _migrate_config(data: dict) -> dict:
     """Apply config migrations while preserving unknown/plugin-owned keys."""
@@ -144,6 +150,38 @@ def save_wake_word_enabled(enabled: bool) -> None:
         except Exception:
             data = {}
     data["wake_word_enabled"] = bool(enabled)
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_wake_sleep_timeout() -> float:
+    """Seconds of silence before the assistant auto-sleeps in wake-word mode.
+
+    Read from config so the window is a setting rather than a constant in
+    main.py. 0.0 disables auto-sleep entirely, which is what you want when the
+    mic is out of reach — you can still put it to sleep by hand.
+
+    A missing or unusable value falls back to the module default rather than
+    raising, so a bad edit to the JSON cannot stop the app from booting.
+    """
+    raw = load_api_keys().get("wake_sleep_timeout", None)
+    if raw is None:
+        return DEFAULT_WAKE_SLEEP_TIMEOUT
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_WAKE_SLEEP_TIMEOUT
+    return max(0.0, value)
+
+
+def save_wake_sleep_timeout(seconds: float) -> None:
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["wake_sleep_timeout"] = max(0.0, float(seconds))
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
 
