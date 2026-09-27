@@ -30,6 +30,7 @@ from core.deep_eye_session import (  # noqa: E402
 
 MIXIN_METHODS = (
     "bind_deep_eye",
+    "_de_gate_settled",
     "_de_request_scan",
     "_de_cancel_scan",
     "_de_ensure_panel",

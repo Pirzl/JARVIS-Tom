@@ -6189,6 +6189,34 @@ class JarvisUI:
     def on_audio_device_change(self, cb):
         self._win.on_audio_device_change = cb
 
+    # ── Deep Eye ───────────────────────────────────────────────────────────
+    # These two are properties for the same reason every other callback here
+    # is. Without them, `self.ui.on_deep_eye_scan = cb` in the session mixin
+    # would set an attribute on the proxy and silently stop there: the panel
+    # reads the same attribute back off the MainWindow, finds nothing, and
+    # reports "Not available" on a perfectly good scanner. That is exactly
+    # what happened — the panel looked wired and scanned nothing.
+
+    @property
+    def on_deep_eye_scan(self):
+        # getattr, not a bare attribute: the panel reads this before anything
+        # has been bound (a click can land before __init__ finishes), and a
+        # bare attribute would raise AttributeError inside the click handler
+        # instead of reporting "not wired yet".
+        return getattr(self._win, "on_deep_eye_scan", None)
+
+    @on_deep_eye_scan.setter
+    def on_deep_eye_scan(self, cb):
+        self._win.on_deep_eye_scan = cb
+
+    @property
+    def on_deep_eye_cancel(self):
+        return getattr(self._win, "on_deep_eye_cancel", None)
+
+    @on_deep_eye_cancel.setter
+    def on_deep_eye_cancel(self, cb):
+        self._win.on_deep_eye_cancel = cb
+
     def show_confirm(self, title: str, detail: str) -> None:
         """Thread-safe: raise the irreversible-action gate. Called from action
         handlers running in executor threads, so it goes through a signal."""

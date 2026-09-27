@@ -62,6 +62,12 @@ class DeepEyeSessionMixin:
         # entry point the voice tool uses, so the gate is raised in exactly
         # one place and no caller can drift from it.
         self.ui.on_deep_eye_scan = self._de_request_scan  # (str) -> None
+        # The gate tells us when it resolves. Without this the panel's SCAN
+        # button stays disabled after a cancel: it is switched off when the
+        # request goes out, and begin() — the only thing that switches it
+        # back — is never called, because nothing started.
+        from core import confirm as _confirm
+        _confirm.set_settled_listener(self._de_gate_settled)
         try:
             from actions import deep_eye as _de_action
             _de_action.bind_session(
@@ -71,6 +77,23 @@ class DeepEyeSessionMixin:
             )
         except Exception as e:
             print(f"[JARVIS] deep eye bind error: {e}")
+
+    def _de_gate_settled(self, key: str, started: bool) -> None:
+        """A confirmation resolved. `started` is True only if a scan is now
+        running.
+
+        Runs on the Qt thread, from resolve(). The panel's SCAN button is off
+        while it waits, and a cancel or a timeout never reaches begin() — so
+        without this it would stay dead for the rest of the session.
+        """
+        if key != "deep_eye_scan":
+            return
+        try:
+            panel = getattr(self.ui._win, "_de_panel", None)
+            if panel is not None:
+                panel.gate_settled(started)
+        except Exception:
+            pass
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -123,11 +146,22 @@ class DeepEyeSessionMixin:
         """Make sure the panel exists and is on screen.
 
         Called before the confirmation gate, so the destination for the output
-        is ready and a cancelled scan still leaves visible evidence of what
-        was about to happen.
+        is ready and a cancelled scan still leaves visible evidence of what was
+        about to happen.
+
+        show_only, not the header button's toggle: _toggle_deep_eye resets the
+        panel when it is not visible, and this runs from _de_on_begin — that
+        is, at the moment the scan starts. Resetting there would wipe the
+        state the panel was just put into, so "Scanning" would never appear.
         """
         try:
-            self.ui._win._toggle_deep_eye(True)
+            win = self.ui._win
+            if getattr(win, "_de_panel", None) is None:
+                win._toggle_deep_eye(True)      # creates it
+            else:
+                panel = win._de_panel
+                panel.show()
+                panel.raise_()
         except Exception as e:
             print(f"[JARVIS] deep eye panel error: {e}")
 

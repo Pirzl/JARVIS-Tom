@@ -63,12 +63,34 @@ _lock = threading.Lock()
 _show_cb: Optional[Callable[[str, str], None]] = None
 _hide_cb: Optional[Callable[[], None]] = None
 _log_cb:  Optional[Callable[[str], None]] = None
+_settled_cb: Optional[Callable[[str, bool], None]] = None
 
 
 def bind(show, hide, log=None) -> None:
     """Wire this module to the HUD. Called once from main.py at startup."""
     global _show_cb, _hide_cb, _log_cb
     _show_cb, _hide_cb, _log_cb = show, hide, log
+
+
+def set_settled_listener(cb) -> None:
+    """Register `cb(key, started)`, called when a gate resolves.
+
+    Separate from bind() on purpose. main.py owns show/hide/log and binds them
+    once at startup; a feature that called bind() to add its own listener
+    would clobber those three with None and silently break the gate it is
+    trying to extend. Two setters, one owner each.
+    """
+    global _settled_cb
+    _settled_cb = cb
+
+
+def _settle(key: str, started: bool) -> None:
+    if _settled_cb is None:
+        return
+    try:
+        _settled_cb(key, started)
+    except Exception:
+        pass
 
 
 def _log(msg: str) -> None:
@@ -134,11 +156,18 @@ def resolve(accepted: bool) -> None:
 
     if time.monotonic() - p.at > TIMEOUT_SECONDS:
         _log(f"SYS: Confirmation expired — {p.title}")
+        _settle(p.key, False)
         return
 
     if not accepted:
         _log(f"SYS: Cancelled — {p.title}")
+        _settle(p.key, False)
         return
+
+    # Settled with started=True BEFORE the thread runs, so the caller can take
+    # its control back synchronously. A failure inside the work is reported
+    # through its own on_done path, not here.
+    _settle(p.key, True)
 
     def _worker():
         try:

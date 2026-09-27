@@ -239,12 +239,35 @@ class DeepEyePanel(QFrame):
             try:
                 self.on_request(target)
             except Exception as e:
-                self._scan_btn.setEnabled(True)
+                self._awaiting_gate(False)
                 self._status.setText(f"Could not start: {e}")
             return
         # No owner wired: say so rather than sitting silent forever.
-        self._scan_btn.setEnabled(True)
+        self._awaiting_gate(False)
         self._status.setText("Not available")
+
+    def _awaiting_gate(self, waiting: bool) -> None:
+        """Re-enable SCAN unless a scan is actually running.
+
+        request_scan returns as soon as the banner is up; only begin() means
+        the user confirmed and work started. Cancelling the banner therefore
+        calls neither, and a button disabled on the way out with nothing to
+        re-enable it stays dead for the rest of the session — the panel then
+        looks broken in exactly the way an empty panel did.
+
+        A timeout is the same case: the gate expires, nothing happens, and the
+        button must come back.
+        """
+        self._scan_btn.setEnabled(not waiting and not self._running)
+
+    def gate_settled(self, started: bool) -> None:
+        """Called when the confirmation resolves. `started` is True only if a
+        scan is really under way."""
+        if started:
+            return                      # begin() owns the UI from here
+        self._awaiting_gate(False)
+        self._status.setText("Cancelled" if not self._running else self._status.text())
+        self._target_edit.setFocus()
 
     def begin(self, target: str) -> None:
         self._running = True
