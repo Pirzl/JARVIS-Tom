@@ -5231,31 +5231,60 @@ class MainWindow(QMainWindow):
     # ── Wake word settings ───────────────────────────────────────────────────
 
     def _wake_state(self) -> dict:
-        """Combined state for the two wake-word buttons. Readiness is a cheap,
+        """Combined state for the wake-word buttons. Readiness is a cheap,
         deterministic on-disk check now (see core.wake_word.is_ready), so there
-        is nothing to cache — the button never flickers to a stale value."""
+        is nothing to cache — the button never flickers to a stale value.
+
+        Every key the repaint reads must be present in BOTH return paths, not
+        just the one taken when a live session is wired. Returning a partial
+        dict here used to crash the whole app the moment the drawer opened,
+        because the caller indexes the keys directly."""
         if self.wake_get_state:
             try:
                 s = self.wake_get_state()
                 return {"ready": bool(s.get("ready")),
                         "enabled": bool(s.get("enabled")),
-                        "awake": bool(s.get("awake"))}
+                        "awake": bool(s.get("awake")),
+                        "detector_running": bool(s.get("detector_running")),
+                        "timeout": s.get("timeout"),
+                        "timeout_label": s.get("timeout_label", "")}
             except Exception:
                 pass
         # Before JarvisLive has wired its callback (drawer built at startup).
         ready, enabled = False, False
+        timeout, label = 0.0, ""
         try:
             from core.wake_word import is_ready
-            from memory.config_manager import get_wake_word_enabled
+            from memory.config_manager import get_wake_sleep_timeout, get_wake_word_enabled
             ready, enabled = is_ready(), get_wake_word_enabled()
+            timeout = get_wake_sleep_timeout()
+            label = ("∞" if timeout <= 0
+                     else f"{timeout:g}s" if timeout < 60
+                     else f"{int(timeout // 60)}min" if timeout % 60 == 0
+                     else f"{timeout:g}s")
         except Exception:
             pass
-        return {"ready": ready, "enabled": enabled, "awake": True}
+        return {"ready": ready, "enabled": enabled, "awake": True,
+                "detector_running": False, "timeout": timeout,
+                "timeout_label": label}
 
     def _refresh_wake_btns(self):
         if not hasattr(self, '_wake_btn'):
             return
         st = self._wake_state()
+        # A repaint must never be able to take the app down: this runs from a
+        # click handler on the Qt thread, so an exception here closes the
+        # window. Missing keys degrade to a readable label instead.
+        if not isinstance(st, dict):
+            st = {}
+        st = {
+            "ready": bool(st.get("ready")),
+            "enabled": bool(st.get("enabled")),
+            "awake": bool(st.get("awake")),
+            "detector_running": bool(st.get("detector_running")),
+            "timeout": st.get("timeout"),
+            "timeout_label": st.get("timeout_label") or "",
+        }
         _on = f"""
             QPushButton {{ background: #001a08; color: {C.GREEN};
                 border: 1px solid {C.GREEN_D}; border-radius: 3px;
