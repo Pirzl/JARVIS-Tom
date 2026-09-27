@@ -59,6 +59,15 @@ pywinauto;  sys_platform == "win32"
 pywin32;    sys_platform == "win32"
 wmi;        sys_platform == "win32"
 
+# ── Test suite ───────────────────────────────────────────────────────────────
+# Not needed to RUN the assistant — only to run `pytest` over tests/. Install
+# it with:  pip install pytest    (or: python -m pytest -q)
+#
+# The suite is plain unittest, so `python -m unittest discover -s tests` also
+# works with no extra package at all. pytest is here because it gives the
+# per-test reporting and the subtest output the regression tests rely on.
+pytest>=8,<10
+
 # ── Documents, media & hardware readouts ──────────────────────────────────────
 # Every one of these is imported inside a try/except at the point of use, so a
 # missing package disables exactly one feature and never stops the app. They are
