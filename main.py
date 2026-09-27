@@ -97,6 +97,19 @@ from core.wake_word            import (
 # the mic is far away and waking it by hand is impractical.
 WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
 
+
+def _wake_state_label(seconds: float) -> str:
+    """Human form of a listening window, for the log and the settings row."""
+    t = float(seconds)
+    if t <= 0:
+        return "never"
+    if t < 60:
+        return f"{t:g} seconds"
+    if t % 60 == 0:
+        mins = int(t // 60)
+        return f"{mins} minute{'s' if mins != 1 else ''}"
+    return f"{t:g} seconds"
+
 def get_base_dir():
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
@@ -700,6 +713,7 @@ class JarvisLive(LiveConfigMixin, BackgroundLoopsMixin):
         self.ui.on_wake_toggle   = self._ui_wake_toggle   # (enable: bool) -> str
         self.ui.on_wake_manual   = self._ui_wake_manual   # () -> toggle awake/asleep
         self.ui.on_wake_install  = self._ui_wake_install  # () -> (ok, msg)
+        self.ui.on_wake_set_timeout = self._set_wake_timeout_live  # (s) -> None
 
         # Hand the extracted prompt builder (core/live_config.py) the module
         # level names it reads. Last thing in __init__ so every registry it
@@ -717,9 +731,41 @@ class JarvisLive(LiveConfigMixin, BackgroundLoopsMixin):
 
     def _wake_state(self) -> dict:
         # A loaded, running detector is definitively ready; otherwise fall back
-        # to the cheap on-disk model-file check (no Model construction).
         ready = bool(self._wake_detector and self._wake_detector.ready) or wake_is_ready()
-        return {"enabled": self._wake_enabled, "awake": self._awake, "ready": ready}
+        # "ready" and "listening" are different: the model can be present on disk
+        # while the detector was never started, and then the setting is on but
+        # the wake word can never fire. The UI shows that difference.
+        running = bool(self._wake_detector and self._wake_detector.ready
+                       and getattr(self._wake_detector, "_running", False))
+        t = float(self._wake_sleep_timeout)
+        if t <= 0:
+            label = "∞"
+        elif t < 60:
+            label = f"{t:g}s"
+        elif t % 60 == 0:
+            label = f"{int(t // 60)}min"
+        else:
+            label = f"{t:g}s"
+        return {"enabled": self._wake_enabled, "awake": self._awake,
+                "ready": ready, "detector_running": running,
+                "timeout": t, "timeout_label": label}
+
+    def _set_wake_timeout_live(self, seconds: float) -> None:
+        """Apply a new listening window to the running session.
+
+        Called from the settings row so a change takes effect at once instead of
+        needing a restart. The config write is done by the caller; this only
+        updates the value the sleep watcher reads.
+        """
+        self._wake_sleep_timeout = max(0.0, float(seconds))
+        self._last_user_speech = time.monotonic()   # restart the window now
+        if self._awake:
+            self.ui.write_log(
+                f"SYS: Listening window set to "
+                f"{'never sleep' if self._wake_sleep_timeout <= 0 else f'{self._wake_sleep_timeout:g}s'}"
+                f" — sleeping {_wake_state_label(self._wake_sleep_timeout)} from now.")
+        if not self._awake:
+            self.ui.set_state("SLEEPING")
 
     def _ensure_wake_detector(self) -> bool:
         """Load the detector once (model loads on first start). Idempotent."""

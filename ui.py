@@ -3318,6 +3318,7 @@ class MainWindow(QMainWindow):
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by JarvisLive
         self.on_wake_toggle    = None   # callable: (enable: bool) -> str, set by JarvisLive
+        self.on_wake_set_timeout = None  # callable: (seconds: float) -> None
         self.on_wake_manual    = None   # callable: () -> None — manual sleep/wake
         self.on_push_to_talk   = None   # callable: (enable: bool) -> str scope
         self.ptt_hold          = None   # callable: (held: bool) -> None — windowed chord
@@ -4357,6 +4358,25 @@ class MainWindow(QMainWindow):
         self._wake_btn.setStyleSheet(_BTN_STYLE_DIM)
         self._wake_sleep_btn.hide()
 
+        # ── How long it stays awake after the wake word ───────────────────
+        # The listening window is the single most annoying thing to get
+        # wrong by default: too long and the assistant keeps answering a room
+        # it was never addressed to, too short and you have to repeat yourself.
+        # Three buttons plus "never" rather than a spinner, because the useful
+        # values are a handful and one click beats a drag.
+        self._wake_timeout_btns = []
+        for label, seconds in (("10s", 10), ("20s", 20), ("30s", 30), ("∞", 0)):
+            b = QPushButton(label)
+            b.setFixedHeight(26)
+            b.setFont(QFont("Courier New", 7))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setCheckable(True)
+            b.clicked.connect(
+                lambda _checked=False, s=seconds: self._set_wake_timeout(s))
+            b.hide()
+            lay.addWidget(b)
+            self._wake_timeout_btns.append((b, seconds))
+
         self._ptt_btn = QPushButton()
         self._ptt_btn.setFixedHeight(26)
         self._ptt_btn.setFont(QFont("Courier New", 7))
@@ -5252,8 +5272,15 @@ class MainWindow(QMainWindow):
             self._wake_btn.setStyleSheet(_off)
             self._wake_sleep_btn.hide()
         elif st["enabled"]:
-            self._wake_btn.setText("🎙  WAKE WORD: ON")
-            self._wake_btn.setStyleSheet(_on)
+            # Say whether it is really LISTENING, not merely switched on: the
+            # setting and the loaded model are two different things, and only
+            # one of them means the wake word can fire.
+            listening = st.get("detector_running", False)
+            self._wake_btn.setText(
+                f"🎙  WAKE WORD: ON · {st['timeout_label']}"
+                + ("" if listening else "  · ⚠ NO ESCUCHA")
+            )
+            self._wake_btn.setStyleSheet(_on if listening else _off)
             self._wake_sleep_btn.show()
             self._wake_sleep_btn.setText("😴  SLEEP NOW" if st["awake"] else "👂  WAKE NOW")
             self._wake_sleep_btn.setStyleSheet(_off)
@@ -5261,6 +5288,29 @@ class MainWindow(QMainWindow):
             self._wake_btn.setText("🎙  WAKE WORD: OFF")
             self._wake_btn.setStyleSheet(_off)
             self._wake_sleep_btn.hide()
+
+        # The listening-window row belongs to the ON state only; pass the
+        # current value either way so the buttons are never left checked from
+        # a previous visit to the drawer.
+        #
+        # The value comes from the running session, NOT from the config file:
+        # the live setter may have moved it, and reading the file here would
+        # mark the wrong button for one refresh after a click.
+        current = None
+        cb = getattr(self, "wake_get_state", None)
+        if callable(cb):
+            try:
+                current = cb().get("timeout")
+            except Exception:
+                current = None
+        if current is None:
+            try:
+                from memory.config_manager import get_wake_sleep_timeout
+                current = get_wake_sleep_timeout()
+            except Exception:
+                current = None
+        if current is not None:
+            self._refresh_wake_timeout_btns(current)
 
     def _refresh_talk_btns(self):
         """Repaint the push-to-talk row from the saved setting."""
@@ -5288,6 +5338,51 @@ class MainWindow(QMainWindow):
             "while you are not holding it." if ptt
             else "Hold a key to talk instead of streaming the mic continuously.")
 
+
+    def _set_wake_timeout(self, seconds: float) -> None:
+        """Change how long the assistant stays awake after the wake word.
+
+        Takes effect immediately: the running instance re-reads its window, so
+        there is no need to restart. Falls back to writing the setting alone
+        when the live session is not available (e.g. before boot finishes).
+        """
+        from memory.config_manager import save_wake_sleep_timeout
+        try:
+            save_wake_sleep_timeout(seconds)
+        except Exception as e:
+            self.write_log(f"ERR: Could not save the listening window — {e}")
+            return
+
+        applied = False
+        if self.on_wake_set_timeout:
+            try:
+                self.on_wake_set_timeout(seconds)
+                applied = True
+            except Exception:
+                applied = False
+        if not applied:
+            # No live session yet; the value is persisted and picked up on the
+            # next start, which is the best that can be done from here.
+            try:
+                self.write_log(
+                    "SYS: Listening window saved — it applies from the next start.")
+            except Exception:
+                pass
+        self._refresh_wake_btns()
+
+    def _refresh_wake_timeout_btns(self, current: float) -> None:
+        """Show which listening window is active.
+
+        The whole row is hidden unless the wake word is actually on: with it
+        off, the setting has no effect and a visible choice would be a lie.
+        """
+        btn = getattr(self, "_wake_btn", None)
+        wake_on = bool(
+            btn is not None and btn.isEnabled()
+            and "OFF" not in btn.text() and "DOWNLOAD" not in btn.text())
+        for b, seconds in getattr(self, "_wake_timeout_btns", []):
+            b.setVisible(wake_on)
+            b.setChecked(abs(float(current) - seconds) < 0.001)
 
     def _refresh_hud_btn(self):
         from memory.config_manager import get_hud_style
@@ -5925,6 +6020,14 @@ class JarvisUI:
     @on_push_to_talk.setter
     def on_push_to_talk(self, cb):
         self._win.on_push_to_talk = cb
+
+    @property
+    def on_wake_set_timeout(self):
+        return self._win.on_wake_set_timeout
+
+    @on_wake_set_timeout.setter
+    def on_wake_set_timeout(self, cb):
+        self._win.on_wake_set_timeout = cb
 
     def push_visemes(self, frames, hop: float, at: float) -> None:
         """Thread-safe: post a schedule of (level, openness, width) mouth frames
