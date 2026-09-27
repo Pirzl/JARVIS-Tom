@@ -50,11 +50,31 @@ dist/
 *.egg-info/
 .eggs/
 
+# ── Vendored third-party tools ────────────────────────────────────────────────
+# `vendor/` holds full external projects checked out next to ours (deep-eye and
+# friends) together with their own virtualenvs. They carry their own history,
+# their own .gitignore and tens of thousands of lines we did not write.
+#
+# They must NOT be committed:
+#   * `git pull` in vendor/deep-eye is how the tool gets updated, and a commit
+#     of its contents would make that a merge conflict instead.
+#   * Its data/ dir holds scan results, auth sessions and a RAG index — real
+#     findings about real hosts, i.e. exactly the kind of thing that should not
+#     live in a repository.
+#
+# The pattern stands alone on its line; an inline trailing comment would become
+# part of the pattern and silently match nothing (see the note above).
+vendor/
+
 # ── Virtual environments ──────────────────────────────────────────────────────
 .venv/
 venv/
 env/
 ENV/
+# deep-eye keeps its own interpreter next to the JARVIS one, deliberately:
+# it pins google-genai>=0.8 while JARVIS needs >=2.8,<3, and sharing the venv
+# would break Gemini Live.
+.deep-venv/
 
 # ── Editors and operating systems ─────────────────────────────────────────────
 .vscode/
