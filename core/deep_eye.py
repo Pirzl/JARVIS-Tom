@@ -62,6 +62,11 @@ DEFAULT_TIMEOUT = 900.0
 # traversal, scheme, port or credentials can smuggle through to argv.
 from actions.osint_scan import _normalize_target  # noqa: E402  (shared contract)
 
+# The evidence gate is imported from the project's own core, not vendored:
+# findings cannot be believed without passing it, and it has to be somewhere
+# the scanners cannot reach around.
+from core.evidence_gate import EvidenceGate  # noqa: E402
+
 
 class DeepEyeUnavailable(RuntimeError):
     """Deep Eye is not installed, or its interpreter is missing."""
@@ -241,6 +246,66 @@ def _gemini_key() -> str:
         return str(api_key() or "")
     except Exception:
         return ""
+
+
+def _judge_findings(findings: list) -> list:
+    """Run every finding through the evidence gate before anyone sees it.
+
+    Deep Eye's scanners assign severity by type and never look at the
+    response, so a `critical` arrives whether the SQL error was in the page or
+    merely suspected by a payload heuristic. The LLM then writes the report
+    from that list and the invented findings inherit the invented severity,
+    which is what makes a security report from this tool untrustworthy.
+
+    Judging here rather than in the report writer is deliberate: this is the
+    single point where findings enter the process, so there is exactly one
+    place a finding can be believed. A gate applied at the edge would leave
+    every other consumer -- the HTML report, the JSON, the voice summary --
+    free to read the ungated list.
+
+    Provenance is assigned by what the finding carries, not by what the
+    scanner claimed about itself:
+
+      * real tool evidence attached -> `tool`, the severity stands
+      * a payload and a response compared, or a URL with a line number ->
+        `context`, capped at medium, because that is inference from evidence
+        rather than a confirmed observation
+      * anything else -> `none`, capped at low. A finding with nothing behind
+        it is a guess, and a guess does not get to call itself critical.
+
+    The gate also strips credentials, because a finding's evidence is raw
+    response text and a report that carries a live API key gets forwarded to
+    whoever is fixing the bug.
+    """
+    gate = EvidenceGate()
+    out: list = []
+    for raw in findings or []:
+        if not isinstance(raw, dict):
+            continue
+        finding = dict(raw)
+        finding.setdefault("provenance", _infer_provenance(finding))
+        if not finding.get("evidence") and finding.get("evidence_text"):
+            finding["evidence"] = [{
+                "type": "response",
+                "detail": str(finding["evidence_text"]),
+            }]
+        out.append(gate.apply(finding))
+    return out
+
+
+def _infer_provenance(finding: dict) -> str:
+    """How much of this finding was observed rather than assumed."""
+    if isinstance(finding.get("evidence"), list) and finding["evidence"]:
+        return "tool"
+    if finding.get("payload") and finding.get("response"):
+        return "context"
+    # A concrete target with a location is the shape a scanner produces after
+    # it has actually sent something; a title alone is an assertion.
+    if finding.get("url") and (finding.get("line")
+                               or finding.get("parameter")
+                               or finding.get("location")):
+        return "context"
+    return "none"
 
 
 def _parse_json_findings(stdout: str) -> tuple[list, Optional[Path]]:
@@ -447,6 +512,7 @@ class DeepEyeScan:
         with self._lock:
             output = "\n".join(self._lines)
         findings, report = _parse_json_findings(output)
+        findings = _judge_findings(findings)
         self.result = ScanResult(target=self.target, returncode=code,
                                  output=output, findings=findings,
                                  report_path=report)
