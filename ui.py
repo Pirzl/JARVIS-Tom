@@ -25,7 +25,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
-    QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
+    QFontDatabase, QIcon, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
@@ -6274,9 +6274,30 @@ class JarvisUI:
             Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
+        self._apply_app_icon()
         self._win = MainWindow(face_path)
+        self._win.setWindowIcon(self._app.windowIcon())
         self.root = _RootShim(self._app)
         self._win.show()
+
+    # The icon is set on the QApplication as well as the window, and the two
+    # are not redundant. Windows derives the taskbar button from the *process*
+    # icon when one exists, and falls back to the executable's -- which is
+    # python.exe, hence the Python logo in the taskbar. Setting only the
+    # window leaves the taskbar entry alone, which is exactly the symptom this
+    # fixes. `app.setWindowIcon` is also what makes the icon appear in
+    # Alt-Tab, so both are wanted.
+    _ICON_CANDIDATES = ("config/jarvis.ico", "assets/jarvis_android.ico")
+
+    def _apply_app_icon(self) -> None:
+        here = Path(__file__).resolve().parent
+        for rel in self._ICON_CANDIDATES:
+            path = here / rel
+            if path.exists():
+                icon = QIcon(str(path))
+                if not icon.isNull():
+                    self._app.setWindowIcon(icon)
+                    return
 
     @property
     def muted(self) -> bool:
