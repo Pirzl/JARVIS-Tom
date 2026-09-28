@@ -39,6 +39,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 from urllib.parse import urlparse
@@ -67,6 +68,7 @@ from actions.osint_scan import _normalize_target  # noqa: E402  (shared contract
 # the scanners cannot reach around.
 from core.evidence_gate import EvidenceGate  # noqa: E402
 from core.confidence_gate import ConfidenceGate  # noqa: E402
+from core.scan_coverage import build_coverage, ALL_CHECKS  # noqa: E402
 
 
 class DeepEyeUnavailable(RuntimeError):
@@ -208,6 +210,7 @@ class ScanResult:
     output: str = ""
     findings: list = field(default_factory=list)
     report_path: Optional[Path] = None
+    coverage_path: Optional[Path] = None
 
     @property
     def ok(self) -> bool:
@@ -219,9 +222,30 @@ class ScanResult:
         A finding's raw evidence is a SQL injection string or a token; reading
         that aloud is useless and leaks attack material into the audio stream.
         Severity counts are what a person actually needs to hear.
+
+        The coverage clause is not decoration. "Scan finished with no findings"
+        and "scan checked 23 of 23 things and found nothing" are different
+        claims, and only the second is evidence. Saying the first when the
+        scanner died halfway is how a broken tool gets mistaken for a healthy
+        site.
         """
+        coverage = ""
+        if self.coverage_path is not None:
+            try:
+                data = json.loads(self.coverage_path.read_text(encoding="utf-8"))
+                total, done = data.get("total_available"), data.get("covered")
+                if data.get("complete"):
+                    coverage = f" It ran all {total} checks, so no finding "\
+                               f"means none were there."
+                else:
+                    coverage = (f" Note: it only got through {done} of {total} "
+                                f"checks before it stopped, so a clean result "
+                                f"does not mean the site is clean.")
+            except (OSError, ValueError):
+                coverage = ""
         if not self.findings:
-            return f"Scan of {self.target} finished with no findings."
+            return (f"Scan of {self.target} finished with no findings."
+                    f"{coverage}")
         by_sev: dict = {}
         for f in self.findings:
             sev = str(f.get("severity", "unknown")).lower()
@@ -231,7 +255,7 @@ class ScanResult:
         parts = [f"{by_sev[s]} {s}" for s in order]
         return (f"Scan of {self.target} finished: "
                 f"{len(self.findings)} finding{'s' if len(self.findings) != 1 else ''}"
-                f" ({', '.join(parts)}).")
+                f" ({', '.join(parts)}).{coverage}")
 
 
 def _gemini_key() -> str:
@@ -323,6 +347,52 @@ def _infer_provenance(finding: dict) -> str:
                                or finding.get("location")):
         return "context"
     return "none"
+
+
+def _checks_that_ran(stdout: str) -> list:
+    """Which checks the scanner says it performed, read from its own output.
+
+    Deliberately a best guess. The vendored scanner does not emit a machine
+    readable manifest of what it ran, so this reads the check names it prints
+    as it goes. That is weaker than parsing a manifest, and deliberately so:
+    inventing a list from the code instead would claim coverage for checks that
+    may never have executed, which is the exact dishonesty `core/scan_coverage`
+    exists to prevent.
+
+    Anything not found here is reported as not covered. Erring that way means
+    the report overstates what is missing, never what was checked.
+    """
+    from core.scan_coverage import ALL_CHECKS
+    lowered = stdout.lower()
+    return [c for c in ALL_CHECKS if c in lowered]
+
+
+def _write_coverage(target: str, stdout: str, findings: list,
+                    finished: bool) -> Optional[Path]:
+    """Write coverage.json beside the report, and return its path.
+
+    Written even when the scan failed, and that is the point: a run that died
+    halfway still needs to say which checks it managed before it did, so the
+    absence of findings is not mistaken for a clean result.
+    """
+    from core.scan_coverage import build_coverage
+    record = build_coverage(
+        _checks_that_ran(stdout), findings,
+        target=target, finished=finished,
+        finish_reason="" if finished else "scan ended early")
+    out_dir = VENDOR_DIR / "data" / "coverage"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = out_dir / f"coverage-{stamp}.json"
+        path.write_text(json.dumps(record.as_dict(), indent=2,
+                                   ensure_ascii=False), encoding="utf-8")
+        return path
+    except OSError as exc:
+        # Coverage is a report artefact. Failing to write it must not turn a
+        # finished scan into a failed one.
+        print(f"[JARVIS] no se pudo escribir coverage.json: {exc}")
+        return None
 
 
 def _parse_json_findings(stdout: str) -> tuple[list, Optional[Path]]:
@@ -530,9 +600,15 @@ class DeepEyeScan:
             output = "\n".join(self._lines)
         findings, report = _parse_json_findings(output)
         findings = _judge_findings(findings)
+        # Coverage is written before the return-code checks below, so a scan
+        # that is about to be reported as failed or cancelled still leaves a
+        # record of what it managed to check. That record is the difference
+        # between "nothing found" and "nothing looked at".
+        coverage = _write_coverage(self.target, output, findings,
+                                   finished=code == 0)
         self.result = ScanResult(target=self.target, returncode=code,
                                  output=output, findings=findings,
-                                 report_path=report)
+                                 report_path=report, coverage_path=coverage)
         if self._cancelled.is_set():
             raise ScanCancelled(f"Scan of {self.target} was cancelled.")
         if code == -1 or (code != 0 and not output.strip()):
