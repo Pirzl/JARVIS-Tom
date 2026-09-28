@@ -1,0 +1,200 @@
+--- a/src/sharelink.js
++++ b/src/sharelink.js
+@@ -95,10 +95,45 @@
+     viewer,
+     { onRestore, isNavigationCurrent, cancelOwnedNavigation } = {},
+   ) {
+     this.viewer = viewer;
+     this._onRestore = onRestore; // callback: ({ style, bloom, sharpen }) => void
++
++    // ── JARVIS bridge (local patch, not upstream) ───────────────────────────
++    // Lets an external assistant move the camera by voice.
++    //
++    // It lives here rather than in app/viewer.js because the app rewrites its
++    // own hash continuously: _updateHash() calls history.replaceState every
++    // few hundred milliseconds with the current camera pose. So a URL fragment
++    // is only honoured on a cold start -- by the time a second request arrives
++    // the fragment is the app's own state, not the one that was asked for.
++    // That is why a warm globe ignored every attempt to move it, and why the
++    // listener has to be a method call rather than a URL.
++    window.gevShareLink = this;
++    if (!window.__jarvisFocusHooked) {
++      window.__jarvisFocusHooked = true;
++      window.addEventListener('gev:jarvis-focus', (event) => {
++        const mgr = window.gevShareLink;
++        if (mgr && typeof mgr.jarvisFocus === 'function') {
++          mgr.jarvisFocus(event && event.detail);
++        }
++      });
++    }
++    if (!window.__jarvisMarkersHooked) {
++      window.__jarvisMarkersHooked = true;
++      // Markers arrive on their own event, separate from the camera move, so
++      // the app can be told to look at Madrid AND be told what is over Madrid
++      // -- or be shown markers without the camera jumping somewhere new. Asking
++      // for a report is not a request to move.
++      window.addEventListener('gev:jarvis-markers', (event) => {
++        const mgr = window.gevShareLink;
++        if (mgr && typeof mgr.jarvisMarkers === 'function') {
++          mgr.jarvisMarkers(event && event.detail);
++        }
++      });
++    }
++    // ── end JARVIS bridge ──────────────────────────────────────────────────
+     this._debounceTimer = null;
+     this._currentStyle = 'normal';
+     this._bloomEnabled = false;
+     this._sharpenEnabled = false;
+     this._bloomIntensity = BLOOM_INTENSITY_DEFAULT;
+@@ -530,10 +565,151 @@
+     if (this._destroyed || this._initialRestorePending) return;
+     clearTimeout(this._debounceTimer);
+     this._debounceTimer = setTimeout(() => this._updateHash(), DEBOUNCE_MS);
+   }
+ 
++  /**
++   * Move the camera to a place, on request from an external assistant.
++   *
++   * Added locally for the JARVIS voice bridge. Goes through flyTo and then
++   * setView, the same pair _restoreCamera uses, so the result is a view the
++   * app considers its own: the share hash will describe this position, and
++   * copying the URL out of the address bar gives a link to this place.
++   *
++   * @param {{lat?:number,lon?:number,height?:number,label?:string}} detail
++   */
++  jarvisFocus(detail) {
++    if (this._destroyed || !detail) return false;
++    const lat = Number(detail.lat);
++    const lon = Number(detail.lon);
++    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
++    const height = Number.isFinite(Number(detail.height))
++      ? Number(detail.height)
++      : 400000;
++    let view;
++    try {
++      // fromDegrees with an object literal, matching how the rest of the app
++      // builds a destination. The first version of this built a Cartographic
++      // and passed it to fromRadians, which wants radians not an object --
++      // Cesium rejected it with "Expected longitude to be typeof number,
++      // actual typeof was object" and the camera never moved.
++      view = {
++        destination: Cesium.Cartesian3.fromDegrees(lon, lat, height),
++      };
++    } catch (error) {
++      console.error('[jarvis-focus] destination failed', error);
++      return false;
++    }
++    try {
++      this.viewer.camera.flyTo({
++        ...view,
++        duration: 3.0,
++        easingFunction: Cesium.EasingFunction.CUBIC_IN_OUT,
++        complete: () => {
++          if (!this._destroyed) {
++            this.viewer.camera.setView(view);
++            this.viewer.scene?.requestRender?.();
++          }
++        },
++      });
++    } catch (error) {
++      console.error('[jarvis-focus] flyTo failed', error);
++      try {
++        this.viewer.camera.setView(view);
++      } catch {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  /**
++   * Draw the things a spoken answer just described.
++   *
++   * Added locally for the JARVIS voice bridge, alongside jarvisFocus. The point
++   * is that the dots on screen and the sentence just spoken are the same fact:
++   * the Python side builds both from one lookup, so a marker here can always be
++   * traced back to a number the user heard. Drawing a decorative set of points
++   * would be prettier and worthless.
++   *
++   * Uses a Cesium DataSource collection rather than entities on the viewer's
++   * default collection, so clearing JARVIS's markers cannot disturb anything the
++   * app itself put on the map. The previous layer is removed wholesale rather
++   * than diffed: a stale dot from a previous question is worse than no dot,
++   * because it looks like a current reading.
++   *
++   * @param {{kind?:string, markers?:Array, count?:number, source?:string,
++   *          queriedAt?:string, label?:string}} detail
++   */
++  jarvisMarkers(detail) {
++    if (this._destroyed || !detail) return false;
++    const list = Array.isArray(detail.markers) ? detail.markers : [];
++    const viewer = this.viewer;
++    if (!viewer || !viewer.entities) return false;
++
++    // Clear what the previous answer drew. By id prefix rather than by
++    // removing a DataSource: the app builds no data sources of its own, and
++    // an earlier version used one whose class it could not reliably reach
++    // through the viewer, so the layer silently never existed. Entities in
++    // viewer.entities need no class lookup at all.
++    const PREFIX = 'jarvis-';
++    for (let i = viewer.entities.values.length - 1; i >= 0; i -= 1) {
++      const ent = viewer.entities.values[i];
++      if (ent && typeof ent.id === 'string' && ent.id.startsWith(PREFIX)) {
++        viewer.entities.remove(ent);
++      }
++    }
++    if (!list.length) return true;
++
++    // Only the first few are captioned. Twenty dots with labels is an
++    // unreadable smear; twenty dots with three labels is a picture the eye can
++    // parse. The rest are still there to be hovered.
++    const LABELLED = 3;
++
++    list.forEach((marker, index) => {
++      const lat = Number(marker.lat);
++      const lon = Number(marker.lon);
++      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
++      const argb = (marker.colour ?? 0xffffff).toString(16).padStart(8, '0');
++      const colour = Cesium.Color.fromCssColorString(`#${argb}`);
++      const text = [marker.label || '', marker.detail || '']
++        .filter(Boolean)
++        .join('\n');
++      viewer.entities.add({
++        id: `${PREFIX}${marker.kind || 'point'}-${index}`,
++        position: Cesium.Cartesian3.fromDegrees(lon, lat, 0),
++        point: {
++          pixelSize: marker.kind === 'place' ? 13 : 9,
++          color: colour.withAlpha(0.92),
++          outlineColor: Cesium.Color.BLACK.withAlpha(0.7),
++          outlineWidth: 1,
++          // Ground-clamped: this is a position on a map, not a flight path.
++          // The altitude is in the label, where it can be read.
++          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
++          disableDepthTestDistance: Number.POSITIVE_INFINITY,
++        },
++        label: text
++          ? {
++              text,
++              font: '12px sans-serif',
++              fillColor: Cesium.Color.WHITE,
++              showBackground: true,
++              backgroundColor: Cesium.Color.BLACK.withAlpha(0.6),
++              pixelOffset: new Cesium.Cartesian2(12, -12),
++              show: index < LABELLED,
++              heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
++              disableDepthTestDistance: Number.POSITIVE_INFINITY,
++            }
++          : undefined,
++      });
++    });
++
++    this._jarvisCount = list.length;
++    viewer.scene?.requestRender?.();
++    return true;
++  }
++
+   _updateHash() {
+     if (this._destroyed || this._initialRestorePending) return;
+     const params = this._buildHashParams();
+     if (!params) return;
+     history.replaceState(null, '', `#${params.toString()}`);
