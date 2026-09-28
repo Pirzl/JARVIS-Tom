@@ -49,11 +49,24 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 # Never let a slow or hostile endpoint hold up the assistant's answer. These are
 # public services and any of them can be slow; a voice answer that arrives in
 # 30 seconds is no answer at all.
 DEFAULT_TIMEOUT_S = 12.0
+
+# The Globe app keeps its keys in vendor/gods-eye/.env (FIRMS_MAP_KEY). Reusing
+# that file means one place to change a key, and vendor/ is gitignored, so a
+# key never reaches the repository. It is read lazily and never cached, so
+# fixing a key takes effect on the next question rather than after a restart.
+GEV_ENV = Path(__file__).resolve().parent.parent / "vendor" / "gods-eye" / ".env"
+
+# NASA names a set of "last N hours" datasets. MLAST24h is the one a question
+# about fires today means; the per-sensor sources are what the Globe app layers
+# for detail. MLAST24h is used because a "is there fire near X" question is
+# about the last day, not about one satellite's pass.
+FIRMS_SOURCE = "MLAST24h"
 
 USER_AGENT = "jarvis-osint/1.0 (personal assistant; local use)"
 
@@ -65,6 +78,11 @@ _MIN_INTERVAL_S = {
     "earthquakes": 60.0,
     "weather": 300.0,
     "geocode": 86400.0,      # a city's coordinates do not move
+    # Fire data is a scarce, quota-limited, key-authenticated service, and NASA
+    # allows 500 transactions a day per application. A minute is enough to
+    # answer a question and slow enough not to burn a day's quota by asking it
+    # twice.
+    "fires": 60.0,
 }
 
 _cache: dict[str, tuple[float, object]] = {}
@@ -369,6 +387,139 @@ def satellites(limit: int = 20) -> dict:
     return _cached("satellites", produce)
 
 
+def firms_key() -> str:
+    """The NASA FIRMS map key, from the Globe app's own .env.
+
+    Read fresh every call and never cached, so correcting a key takes effect on
+    the next question. A key that is present but not working is the normal
+    case here rather than an edge case: NASA's own message for a key that is
+    wrong and a key that has exceeded its transaction limit is the same
+    sentence, and both were seen while writing this.
+    """
+    try:
+        for line in GEV_ENV.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            if name.strip().upper() == "FIRMS_MAP_KEY":
+                return value.strip().strip("'\"")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    return ""
+
+
+def fires_near(lat: float, lon: float, radius_km: float = 150.0,
+               days: int = 1, limit: int = 10) -> dict:
+    """Active fire detections near a place, from NASA's VIIRS/FIRMS.
+
+    The only source here that needs a credential, and the one that most needs
+    to be honest about it. Three outcomes are told apart, because they mean
+    different things to someone who asked:
+
+      * no key configured      -> "I can't see fires, nobody gave me a key"
+      * key rejected or spent  -> "the key isn't working, here's NASA's word"
+      * key fine, nothing found-> "no fires, and I can see the sensor"
+
+    The middle case is the one a naive implementation gets wrong. NASA answers
+    400 or 403 with a plain-text body, never CSV, and a parser that treats any
+    non-JSON response as "no data" would answer "there are no fires near you"
+    every single time -- a confident, wrong, safety-relevant answer.
+
+    Never logs the key, and never puts it in an error message: the URL embeds
+    it, so any exception text that included the URL would leak it into a log
+    or a spoken reply.
+    """
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        raise WorldDataError("bad coordinates: %s, %s" % (lat, lon))
+    key = firms_key()
+    if not key:
+        raise WorldDataError(
+            "no hay clave de NASA FIRMS configurada "
+            "(FIRMS_MAP_KEY en vendor/gods-eye/.env)")
+    radius = max(10.0, min(float(radius_km), 400.0))
+    # NASA takes a bounding box. A rough conversion at these latitudes is
+    # accurate enough for a "near me" question and avoids a projection
+    # dependency: one degree of latitude is a constant 111 km.
+    dlat = radius / 111.0
+    dlon = radius / (111.0 * max(0.15, abs(math.cos(math.radians(lat)))))
+    box = ",".join("%.4f" % v for v in (
+        lon - dlon, lat - dlat, lon + dlon, lat + dlat))
+
+    url = ("https://firms.modaps.eosdis.nasa.gov/api/area/csv/%s/%s/%s/%d"
+           % (urllib.parse.quote(key), FIRMS_SOURCE, box, int(days)))
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            text = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace").strip()[:160]
+        except Exception:                             # noqa: BLE001
+            pass
+        # The key is in the URL, so the message is rebuilt from scratch rather
+        # than reusing the exception, which would carry it.
+        if exc.code in (400, 403):
+            # NASA often answers with two lines -- "Invalid MAP_KEY." followed
+            # by "Invalid source." -- and the second is just the same rejection
+            # restated. Only the first is worth telling the user about.
+            for line in detail.splitlines():
+                line = line.strip()
+                if line and "MAP_KEY" in line:
+                    detail = line.rstrip(".")
+                    break
+            raise WorldDataError(
+                "NASA rechaza la clave (%s): %s"
+                % (exc.code, detail or "clave no valida o cuota agotada")) from None
+        raise WorldDataError(
+            "NASA FIRMS HTTP %s" % exc.code) from None
+    except (TimeoutError, OSError) as exc:
+        raise WorldDataError("NASA FIRMS: %s" % type(exc).__name__) from exc
+
+    if "Invalid MAP_KEY" in text or "MAP_KEY is invalid" in text:
+        raise WorldDataError(
+            "NASA dice que la clave no es valida o se paso de transactions")
+
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return {"centre": {"lat": lat, "lon": lon}, "radius_km": radius,
+                "count": 0, "fires": [], "source": "NASA FIRMS"}
+    header = lines[0].split(",")
+    idx = {name.strip(): i for i, name in enumerate(header)}
+
+    out = []
+    for line in lines[1:]:
+        cells = line.split(",")
+        if len(cells) < len(header):
+            continue
+        try:
+            flat, flon = float(cells[idx["latitude"]]), float(cells[idx["longitude"]])
+            km = distance_km(lat, lon, flat, flon)
+        except (KeyError, IndexError, ValueError):
+            continue
+        if km > radius:
+            continue
+        out.append({
+            "lat": flat,
+            "lon": flon,
+            "distance_km": round(km, 1),
+            "bearing": compass_span(bearing_deg(lat, lon, flat, flon)),
+            # These are satellite names, not places: "VIIRS" is the sensor.
+            "satellite": (cells[idx["satellite"]] if "satellite" in idx else None),
+            "confidence": (cells[idx["confidence"]] if "confidence" in idx else None),
+            "brightness": (cells[idx["brightness"]] if "brightness" in idx else None),
+            "acq_date": (cells[idx["acq_date"]] if "acq_date" in idx else None),
+            "acq_time": (cells[idx["acq_time"]] if "acq_time" in idx else None),
+            "frp": (float(cells[idx["frp"]]) if "frp" in idx
+                    and cells[idx["frp"]] not in ("", "0.0") else None),
+        })
+    out.sort(key=lambda f: f["distance_km"])
+    return {"centre": {"lat": lat, "lon": lon}, "radius_km": radius,
+            "count": len(out), "fires": out[:limit],
+            "source": "NASA FIRMS (%s)" % FIRMS_SOURCE}
+
+
 def weather(lat: float, lon: float) -> dict:
     """Current conditions at a point.
 
@@ -467,8 +618,26 @@ def sources() -> dict:
         except Exception as exc:                        # noqa: BLE001
             out[label] = {"ok": False,
                           "detail": "%s: %s" % (type(exc).__name__, exc)[:120]}
-    out["fires (NASA FIRMS)"] = {
-        "ok": False,
-        "detail": "needs a mapkey; not configured, so fire data is not reported",
-    }
+    out["fires (NASA FIRMS)"] = _firms_status()
     return out
+
+
+def _firms_status() -> dict:
+    """Is fire data actually available?
+
+    Reports the three states separately, because "no fires" and "I cannot see
+    fires" are opposites and conflating them is how an assistant ends up
+    reassuring someone about a wildfire it never looked for. The probe asks for
+    a one-square-kilometre box, which is a single transaction against a
+    500-a-day allowance -- cheap enough to run in the doctor.
+    """
+    if not firms_key():
+        return {"ok": False, "detail": "no FIRMS_MAP_KEY in "
+                                       "vendor/gods-eye/.env", "keyed": False}
+    try:
+        # A deliberately tiny box in the middle of nowhere: it costs one
+        # transaction and cannot be confused with a real answer.
+        fires_near(0.0, 0.0, radius_km=10.0, limit=1)
+        return {"ok": True, "detail": "key accepted", "keyed": True}
+    except WorldDataError as exc:
+        return {"ok": False, "detail": str(exc)[:120], "keyed": True}

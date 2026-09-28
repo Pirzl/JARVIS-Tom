@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import sys
 import unittest
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
@@ -40,6 +42,26 @@ JEREZ = {"query": "Jerez de la Frontera", "name": "Jerez de la Frontera",
          "country": "España", "admin1": "Andalucía",
          "lat": 36.68645, "lon": -6.13606,
          "source": "open-meteo-geocoding"}
+
+
+class _Resp:
+    """A successful HTTP response, for the paths that do not raise.
+
+    NASA can report a rejected key with a 200 and a plain-text body, so the
+    success path needs a stand-in that is not an exception.
+    """
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 def _ac(hex_="abc123", flight="RYR144G", reg="EI-EKM", km=41.2, ft=35000,
@@ -273,6 +295,130 @@ class TestBriefingIsHonestAboutGaps(unittest.TestCase):
             out = wl.world_look({"action": "aircraft", "place": "Madrid"})
         self.assertIn("en tierra", out)
         self.assertNotIn("pies de altura", out)
+
+
+class TestFiresAreNeverConflatedWithSilence(unittest.TestCase):
+    """"No fires" and "I cannot see fires" are opposites.
+
+    This is the most safety-relevant thing in the module, and the easiest to
+    get wrong: NASA answers a bad key with 400 and a plain-text body, never
+    CSV. Any parser that treats "not CSV" as "no rows" answers "there are no
+    fires near you" -- confidently, and every single time. The three cases
+    below each have to be distinguishable.
+    """
+
+    def test_no_key_says_it_cannot_see_fires(self):
+        with _Stub(self, geocode=lambda p: JEREZ, firms_key=lambda: "",
+                   fires_near=lambda *a, **k: (_ for _ in ()).throw(
+                       wd.WorldDataError(
+                           "no hay clave de NASA FIRMS configurada "
+                           "(FIRMS_MAP_KEY en vendor/gods-eye/.env)"))):
+            out = wl.world_look({"action": "fires", "place": "Jerez"})
+        self.assertIn("no puedo ver incendios", out.lower())
+        # The dangerous phrase must be absent.
+        self.assertNotIn("no hay focos", out.lower())
+
+    def test_a_rejected_key_does_not_ask_the_user_to_configure_it(self):
+        """The first version did, and it was actively misleading.
+
+        The key was already there; NASA was refusing it. "In cuanto lo
+        configures" sends someone to look at a setting that is already right,
+        and away from the real cause.
+        """
+        with _Stub(self, geocode=lambda p: JEREZ, firms_key=lambda: "abc",
+                   fires_near=lambda *a, **k: (_ for _ in ()).throw(
+                       wd.WorldDataError(
+                           "NASA rechaza la clave (400): Invalid MAP_KEY"))):
+            out = wl.world_look({"action": "fires", "place": "Jerez"})
+        self.assertIn("no me la acepta", out)
+        self.assertNotIn("en cuanto lo configures", out.lower())
+        # "transactions" is NASA's own word for the daily allowance, so it is
+        # what the user will see in NASA's error and needs to recognise here.
+        self.assertIn("transactions", out)
+
+    def test_an_upstream_outage_is_not_reported_as_no_fires(self):
+        def boom(*a, **k):
+            raise wd.WorldDataError("NASA FIRMS: TimeoutError")
+        with _Stub(self, geocode=lambda p: JEREZ, firms_key=lambda: "abc",
+                   fires_near=boom):
+            out = wl.world_look({"action": "fires", "place": "Jerez"})
+        self.assertIn("no me está respondiendo", out)
+        self.assertNotIn("no hay focos", out.lower())
+
+    def test_a_genuine_zero_is_still_reported_as_a_zero(self):
+        """With a working key and no detections, the answer is a real zero.
+
+        The whole point of telling the three cases apart is that this one still
+        says there is nothing there.
+        """
+        with _Stub(self, geocode=lambda p: JEREZ, firms_key=lambda: "abc",
+                   fires_near=lambda *a, **k: {
+                       "count": 0, "radius_km": 300, "fires": [],
+                       "source": "NASA FIRMS (MLAST24h)"}):
+            out = wl.world_look({"action": "fires", "place": "Jerez"})
+        self.assertIn("No hay focos de incendio", out)
+        self.assertIn("NASA FIRMS", out)
+
+    def test_the_error_never_carries_the_key(self):
+        """The key is in the URL, so any error text that echoed a URL leaks it.
+
+        The exception is rebuilt from the status and the body rather than
+        reused, precisely so the URL cannot appear in a spoken reply or a log.
+        """
+        secret = "SECRETKEY1234567890"
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            raise HTTPError(req.full_url, 400, "Bad Request", {},
+                            BytesIO(b"Invalid MAP_KEY."))
+
+        real = wd.urllib.request.urlopen
+        try:
+            wd.urllib.request.urlopen = fake_urlopen
+            with _Stub(self, firms_key=lambda: secret):
+                with self.assertRaises(wd.WorldDataError) as caught:
+                    wd.fires_near(36.68, -6.13, 100.0)
+            self.assertIn(secret, captured["url"])       # the request did have it
+            self.assertNotIn(secret, str(caught.exception),
+                             "the key must not survive into the message")
+        finally:
+            wd.urllib.request.urlopen = real
+
+    def test_the_schema_tells_the_model_not_to_guess(self):
+        """The model reads this to decide how to phrase a failed lookup.
+
+        Asserted as a set of required words rather than one exact sentence, so
+        rewording the description does not break the test but removing the
+        instruction does -- which is what matters. A mutation check confirmed
+        that deleting this instruction is otherwise invisible.
+        """
+        desc = (wl.TOOL["description"]
+                + " " + wl.TOOL["parameters"]["properties"]["action"]["description"])
+        low = desc.lower()
+        for needed in ("nasa key", "no fires", "rather than"):
+            self.assertIn(needed, low,
+                          "the schema must tell the model not to invent a "
+                          "clean 'no fires' when the source is unavailable")
+
+    def test_a_key_rejection_inside_a_200_is_still_a_rejection(self):
+        """The parse guard, tested through the function that depends on it.
+
+        NASA normally rejects a key with 400, and that path is covered. But a
+        200 whose body says "Invalid MAP_KEY." is the same rejection arriving
+        by another door: a parser that only looks at the status code would take
+        those lines for a header, find no data rows, and report zero fires.
+        """
+        real = wd.urllib.request.urlopen
+        payload = b"Invalid MAP_KEY.\nInvalid source.\n"
+        try:
+            wd.urllib.request.urlopen = lambda *a, **k: _Resp(payload)
+            with _Stub(self, firms_key=lambda: "abc"):
+                with self.assertRaises(wd.WorldDataError) as caught:
+                    wd.fires_near(36.68, -6.13, 100.0)
+            self.assertIn("no es valida", str(caught.exception).lower())
+        finally:
+            wd.urllib.request.urlopen = real
 
 
 class TestGlobeBridgeIsWired(unittest.TestCase):

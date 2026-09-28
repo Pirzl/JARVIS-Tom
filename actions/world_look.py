@@ -200,6 +200,61 @@ def _satellites(limit: int = 8) -> str:
     return "\n".join(lines)
 
 
+def _fires(place: dict, radius_km: float) -> str:
+    """Fire detections near a place.
+
+    The only answer here that can come back as an apology rather than a fact,
+    and that is correct in two of the three cases. "I cannot see fires" and
+    "there are no fires" are opposites; the difference is whether a key is
+    configured and working, and saying which applies is the whole job. The
+    Globe app's own guidance is the same -- if the fires layer is unavailable,
+    say so plainly.
+    """
+    try:
+        data = wd.fires_near(place["lat"], place["lon"], radius_km)
+    except wd.WorldDataError as exc:
+        detail = str(exc)
+        low = detail.lower()
+        # Three different situations that all arrive as an exception, and the
+        # user needs different words for each. Telling someone to "configure it"
+        # when they already have and NASA is refusing it would send them
+        # looking in the wrong place.
+        if "no hay clave" in low or "no firms_map_key" in low:
+            return ("Ahora mismo no puedo ver incendios: todavía no hay una "
+                    "clave de NASA configurada. En cuanto la pongas te los podré "
+                    "dar.")
+        if "rechaza" in low or "no es valida" in low or "transacciones" in low:
+            return ("La clave de NASA está puesta pero no me la acepta: %s. "
+                    "Puede que necesite activación, que se haya caducado, o que "
+                    "te hayas pasado de transactions. Los aviones y los "
+                    "terremotos sí que funcionan." % detail)
+        return ("La fuente de incendios no me está respondiendo: %s. Los "
+                "terremotos y los aviones sí que funcionan." % detail)
+
+    if data["count"] == 0:
+        return ("No hay focos de incendio en %d km alrededor de %s en las "
+                "últimas 24 horas. Fuente %s, a las %s."
+                % (data["radius_km"], _fmt_place(place), data["source"],
+                   _when()))
+
+    lines = ["Hay %d focos de incendio en %d km alrededor de %s. Fuente %s, "
+             "a las %s." % (data["count"], data["radius_km"], _fmt_place(place),
+                            data["source"], _when())]
+    words = {"low": "baja", "nominal": "normal", "high": "alta"}
+    for fire in data["fires"][:4]:
+        bits = ["a %.0f km al %s" % (fire["distance_km"], fire["bearing"])]
+        if fire.get("confidence") in words:
+            bits.append("confianza %s" % words[fire["confidence"]])
+        # Radiative power in megawatts. Spoken as a raw number it means nothing
+        # to a listener, so it becomes a plain description instead: above 100 MW
+        # is a substantial fire, not a campfire.
+        frp = fire.get("frp")
+        if frp:
+            bits.append("fuego muy intenso" if frp >= 100 else "fuego")
+        lines.append("  " + ", ".join(bits) + ".")
+    return "\n".join(lines)
+
+
 def _weather(place: dict) -> str:
     w = wd.weather(place["lat"], place["lon"])
     lines = ["En %s ahora mismo: %s, %.0f grados, sensación de %.0f. "
@@ -251,6 +306,22 @@ def _briefing(place: dict, radius_km: float, want_globe: bool) -> str:
         else:
             head.append("  Terremotos: ninguno registrado cerca.")
 
+    # Fire data is optional and key-gated, so a brief that cannot reach it says
+    # so rather than quietly listing three sources out of four. "No hay datos
+    # de incendios" would be indistinguishable from "no hay incendios".
+    try:
+        fires = wd.fires_near(data["place"]["lat"], data["place"]["lon"],
+                              max(radius_km, 200.0))
+        if fires["count"]:
+            worst = fires["fires"][0]
+            head.append("  Incendios: %d focos, el más cercano a %.0f km al %s."
+                        % (fires["count"], worst["distance_km"],
+                           worst["bearing"]))
+        else:
+            head.append("  Incendios: ninguno en %d km." % fires["radius_km"])
+    except wd.WorldDataError as exc:
+        head.append("  Incendios: no disponible (%s)." % exc)
+
     sats = data.get("satellites")
     if sats:
         head.append("  Satélites: %d con señal activa." % sats["count"])
@@ -270,8 +341,9 @@ def _sources() -> str:
     for label, info in wd.sources().items():
         out.append("  %s %s — %s" % ("✓" if info["ok"] else "✗", label,
                                      info["detail"]))
-    out.append("Todo son datos públicos. Los incendios por satélite necesitan una "
-               "clave que no tengo, así que no te los puedo dar.")
+    out.append("Todo son datos públicos. Los incendios por satélite dependen de "
+               "una clave de la NASA: si no está configurada o no funciona, te "
+               "lo diré en vez de decirte que no hay.")
     return "\n".join(out)
 
 
@@ -316,6 +388,10 @@ def world_look(parameters: dict, speak=None) -> str:
         "overhead": 150.0,
         "earthquakes": 1200.0, "terremotos": 1200.0, "seismic": 1200.0,
         "sismos": 1200.0,
+        # A wildfire can be 30 km away and still matter, so "is there fire near
+        # X" gets a wider net than "what is flying overhead". Kept to 400 km
+        # because NASA rejects a larger box, not because of the voice.
+        "fires": 300.0, "incendios": 300.0, "fuego": 300.0, "wildfires": 300.0,
         "overview": 150.0, "briefing": 150.0, "brief": 150.0, "todo": 150.0,
     }.get(action, 150.0)
     try:
@@ -330,6 +406,8 @@ def world_look(parameters: dict, speak=None) -> str:
             return _aircraft(located, radius_km, want_globe)
         if action in ("earthquakes", "terremotos", "seismic", "sismos"):
             return _quakes(located, radius_km)
+        if action in ("fires", "incendios", "fuego", "wildfires"):
+            return _fires(located, radius_km)
         if action in ("weather", "tiempo", "meteo", "clima"):
             return _weather(located)
     except wd.WorldDataError as exc:
@@ -351,14 +429,17 @@ TOOL = {
         "Answers questions about what is happening in the world right now, from "
         "live public data: aircraft currently flying near a place (with callsign, "
         "distance, bearing, altitude and speed), earthquakes in the last 24 hours, "
-        "satellites broadcasting a tracking signal, current weather, or a combined "
-        "briefing on any city. Works with a place name, so 'what is flying over "
-        "Jerez' or 'anything happening in Madrid' both work. "
+        "active fire detections (wildfires), satellites broadcasting a tracking "
+        "signal, current weather, or a combined briefing on any city. Works with "
+        "a place name, so 'what is flying over Jerez' or 'is there fire near "
+        "Malaga' both work. "
         "If the user names a place, pass it as `place`. If they say 'here', 'near "
         "me' or nothing at all, ask which place rather than assuming one. "
         "Reports exactly what the sources returned, including when the answer is "
-        "that nothing is there. Public broadcast data only: no private tracking of "
-        "individuals."
+        "that nothing is there. IMPORTANT: fire data needs a NASA key; if it is "
+        "unavailable the answer says so explicitly, and you must repeat that "
+        "rather than telling the user there are no fires. Public broadcast data "
+        "only: no private tracking of individuals."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -366,8 +447,8 @@ TOOL = {
             "action": {
                 "type": "STRING",
                 "description": (
-                    "aircraft | earthquakes | weather | satellites | overview | "
-                    "sources"
+                    "aircraft | earthquakes | fires | weather | satellites | "
+                    "overview | sources"
                 ),
             },
             "place": {
@@ -382,8 +463,8 @@ TOOL = {
                 "type": "INTEGER",
                 "description": (
                     "Search radius in kilometres around the place. Default 150 "
-                    "(suitable for 'overhead'). Use up to 400 for aircraft, "
-                    "500-2000 for earthquakes."
+                    "for aircraft, 1200 for earthquakes, 300 for fires. Use up "
+                    "to 400 for aircraft, 2000 for earthquakes."
                 ),
             },
             "show_on_map": {

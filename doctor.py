@@ -186,10 +186,18 @@ class Doctor:
             return
         wd._cache.clear()
         for label, info in wd.sources().items():
-            # A source that needs a key we do not have is a configuration
-            # choice, not a fault, so it is a warning rather than a failure.
-            optional = not info["ok"] and "mapkey" in info["detail"]
-            self.check("Source: %s" % label, info["ok"], info["detail"],
+            # Fires is a warning, not a failure, whenever the key is the
+            # problem: a key that is absent, invalid or over its quota is
+            # configuration still to be done, not a broken install. The doctor
+            # exits non-zero on failures, and that would make every startup
+            # look unhealthy for something the user can fix in a minute. A
+            # source that is *down* while its key works is still a failure.
+            optional = not info["ok"] and (
+                "key" in info["detail"].lower()
+                or "map_key" in info["detail"].lower()
+            )
+            self.check("Source: %s" % label, info["ok"],
+                       info["detail"].replace("\n", " ")[:120],
                        warning=optional)
 
 
