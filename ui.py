@@ -4648,6 +4648,43 @@ class MainWindow(QMainWindow):
             # it. The panel creates the view itself once the port answers.
             panel.start_server_async()
 
+    def focus_world(self, lat: float, lon: float, label: str = "") -> None:
+        """Point the globe at a place, opening it if it is not already up.
+
+        Reached from the voice path ("show me where that is"), so it has to work
+        from a cold start too. The camera move is handed to the page as a URL
+        fragment, which the Globe app reads on load -- the only channel that
+        survives the page being served from a dev server.
+
+        Every failure here is swallowed by the caller, because the spoken answer
+        was already delivered; the map is the extra, not the request.
+        """
+        try:
+            from ui_world_view import GlobePanel
+        except ImportError as exc:
+            print(f"[JARVIS] world view unavailable: {exc}")
+            return
+        # The hash format the app actually reads, built by the panel that
+        # knows it. See GlobePanel.focus_params.
+        try:
+            query = GlobePanel.focus_params(lat, lon, 400000.0, str(label or ""))
+        except Exception as exc:                            # noqa: BLE001
+            print(f"[JARVIS] world focus not built ({type(exc).__name__}: {exc})")
+            return
+        if self._world_panel is None:
+            self._world_panel = GlobePanel()
+        panel = self._world_panel
+        panel.show()
+        panel.raise_()
+        panel.activateWindow()
+        if not panel.is_running():
+            # A cold start is about twenty seconds. The panel builds its view
+            # once the port answers, and the position rides along on that URL.
+            panel.start_server_async(focus=query)
+        else:
+            panel.ensure_view()
+            panel.focus_globe(float(lat), float(lon), label=str(label or ""))
+
     def _position_deep_eye(self, panel) -> None:
         """Centre the panel over the HUD.
 

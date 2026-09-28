@@ -39,6 +39,7 @@ and CPU. That is the mitigation for the 109 ms spikes measured earlier.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -131,6 +132,9 @@ class GlobePanel(QWidget):
         # True while a start is in flight, so a second click does not launch a
         # second server on the same port.
         self._starting = False
+        # A camera position waiting to be delivered to the page on its next
+        # load, set by the voice path. Empty means "show the world as it was".
+        self._pending_focus = ""
         # Worker thread -> Qt thread. Queued by default, so the slot runs on the
         # thread that owns the widgets.
         self._started_ok.connect(self._on_started)
@@ -213,7 +217,7 @@ class GlobePanel(QWidget):
 
     # ── control ─────────────────────────────────────────────────────────────
 
-    def start_server_async(self) -> None:
+    def start_server_async(self, focus: str = "") -> None:
         """Start the server without blocking the UI thread.
 
         start_server() waits for the port to answer, and a cold start measured
@@ -222,9 +226,18 @@ class GlobePanel(QWidget):
         the voice would all stop. So the wait happens on a worker thread and the
         UI thread stays free; when the port answers, the view is created.
 
+        `focus` is an optional camera position ("lat=..&lon=..&z=..") to deliver
+        to the page when it loads, used by the voice path so that "show me
+        Madrid" lands on Madrid rather than wherever the globe was left. It is
+        recorded before the thread starts, so the page is created already
+        pointing at the right place -- moving the camera after the fact is not
+        possible from here.
+
         This is the same rule the rest of the app follows: work that can take
         seconds never runs on the thread that paints.
         """
+        if focus:
+            self._pending_focus = focus
         if self._starting:
             return
         self._starting = True
@@ -417,8 +430,87 @@ class GlobePanel(QWidget):
         # Insert the view directly above the header, below which the layout has
         # the placeholder's slot.
         self.layout().insertWidget(self.layout().count() - 1, view)
-        view.load(QUrl(self.server_url()))
+        view.load(QUrl(self._page_url()))
         return True
+
+    def _page_url(self) -> str:
+        """The app URL, carrying any pending camera position.
+
+        The hash format is the app's own: vendor/gods-eye/src/sharelink.js reads
+        `#lat=..&lon=..&alt=..&heading=..&pitch=..` in parseInitialHash(). The
+        first attempt here used `#focus=lat=..`, which parses to nothing -- the
+        parameter is read straight off the hash, not out of a nested key, so a
+        wrapper is silently ignored and the globe opens wherever it last was.
+        Found by reading sharelink.js after a screenshot showed the camera
+        still on its default view of San Antonio after a request for Madrid.
+
+        alt is in metres and is the camera height above the ground, not an
+        orbital altitude. 800 is close enough to read a city; 600000 is the
+        continental view the app defaults to.
+        """
+        base = self.server_url()
+        if not self._pending_focus:
+            return base
+        return "%s#%s" % (base, self._pending_focus)
+
+    @staticmethod
+    def focus_params(lat: float, lon: float, height: float = 400000.0,
+                     label: str = "") -> str:
+        """Build the hash the app understands. Degrees, not radians.
+
+        The app's own share links are the reference here: this produces the same
+        shape, so a position that works in a shared URL works when spoken.
+        """
+        return ("lat=%.6f&lon=%.6f&alt=%.0f&heading=0&pitch=-45&roll=0"
+                % (float(lat), float(lon), float(height)))
+
+    def focus_globe(self, lat: float, lon: float, height: float = 400000.0,
+                    label: str = "") -> None:
+        """Move the camera to a place, on a globe that is already open.
+
+        By dispatching an event the page handles, not by reloading. That is not
+        a stylistic choice -- it is the only thing that works, and three
+        approaches were tried first:
+
+          * query string: the app uses location.search for its first-run and
+            key-setup features and ignores it for the camera
+          * `#lat=..&lon=..` on reload: works on a cold start, and the cold
+            start test passed. It fails on a warm globe because the app
+            rewrites its own hash continuously -- sharelink.js _updateHash()
+            calls history.replaceState with the current pose every few hundred
+            milliseconds, so the fragment that was set is the app's state by
+            the time the second request goes out. Measured: 14 polls over 90
+            seconds, camera unmoved at San Antonio, the app's default.
+          * a CustomEvent with a setView in a page-side shim: the shim was in
+            app/viewer.js and the listener never fired
+
+        So the listener is a method call on the app's own ShareLinkManager,
+        added in a small documented patch to vendor/gods-eye/src/sharelink.js.
+        That class already owns the camera, already animates moves the same
+        way, and already keeps the share link in step -- so the result is a
+        view the app treats as its own, and copying the address bar afterwards
+        gives a link to that place.
+
+        Reloading is still the right thing for a cold start: nothing is
+        listening until the page has loaded, and the hash is read on load. So
+        _pending_focus is kept in sync either way, and a later reload lands in
+        the same place rather than reverting.
+        """
+        self._pending_focus = self.focus_params(lat, lon, height, label)
+        if self._view is None:
+            return                      # a cold start: the hash does the work
+        js = (
+            "window.dispatchEvent(new CustomEvent('gev:jarvis-focus',"
+            "{detail:{lat:%f,lon:%f,height:%f,label:%s}}));"
+            "document.title='JEV:'+!!window.gevShareLink;"
+            % (float(lat), float(lon), float(height),
+               json.dumps(str(label or "")[:60])))
+        try:
+            self._view.page().runJavaScript(js)
+        except Exception as exc:                            # noqa: BLE001
+            # The page may be mid-navigation. _pending_focus still holds the
+            # position, so the next load lands correctly.
+            self._set_status("focus pending (%s)" % type(exc).__name__, "#ffd166")
 
     def _make_resize_hook(self, view):
         base = view.resizeEvent

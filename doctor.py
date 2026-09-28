@@ -41,6 +41,8 @@ class Doctor:
         self.registries()
         self.tls()
         self.gmail()
+        self.check_world_view()
+        self.check_world_sources()
         print(f"\nSummary: {self.failures} failure(s), {self.warnings} warning(s)")
         return 1 if self.failures else 0
 
@@ -138,6 +140,57 @@ class Doctor:
             self.check("Gmail OAuth", ok, "read-only scope present" if ok else "read-only scope missing")
         except Exception as exc:
             self.check("Gmail OAuth", False, f"token cannot be read ({exc})")
+
+    def check_world_view(self) -> None:
+        """The globe panel and the live data behind the voice answers.
+
+        Two separate things, checked separately. The panel needs Node and a
+        checkout; the data needs the public feeds. A user whose globe will not
+        open and a user whose answers are empty have different problems, and
+        the doctor should not report both as "World View failed".
+        """
+        import shutil
+        root = Path(__file__).resolve().parent
+        gev = root / "vendor" / "gods-eye"
+        self.check("World View checkout", (gev / "package.json").exists(),
+                   str(gev) if (gev / "package.json").exists()
+                   else "run: git clone gods-eye-view vendor/gods-eye")
+        self.check("World View node_modules", (gev / "node_modules").exists(),
+                   "installed" if (gev / "node_modules").exists()
+                   else "run: npm install in vendor/gods-eye")
+        node = shutil.which("node")
+        self.check("Node", node is not None,
+                   node or "not on PATH -- the globe cannot start")
+        try:
+            import PyQt6.QtWebEngineWidgets  # noqa: F401
+            self.check("QtWebEngine", True, "installed")
+        except Exception as exc:  # noqa: BLE001
+            self.check("QtWebEngine", False,
+                       f"not available ({type(exc).__name__})")
+
+    def check_world_sources(self) -> None:
+        """Probe the public feeds rather than trusting the configuration.
+
+        These are other people's free services. A source that has gone down or
+        started rate-limiting shows up here as a fact rather than as a vague
+        failure the first time somebody asks a question.
+
+        Probing takes a few seconds, so the short cache is cleared first: the
+        doctor should report what is true now, not what was true an hour ago.
+        """
+        try:
+            from core import world_data as wd
+        except Exception as exc:  # noqa: BLE001
+            self.check("World sources", False,
+                       f"module cannot be imported ({type(exc).__name__})")
+            return
+        wd._cache.clear()
+        for label, info in wd.sources().items():
+            # A source that needs a key we do not have is a configuration
+            # choice, not a fault, so it is a warning rather than a failure.
+            optional = not info["ok"] and "mapkey" in info["detail"]
+            self.check("Source: %s" % label, info["ok"], info["detail"],
+                       warning=optional)
 
 
 if __name__ == "__main__":

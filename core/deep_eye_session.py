@@ -78,6 +78,36 @@ class DeepEyeSessionMixin:
         except Exception as e:
             print(f"[JARVIS] deep eye bind error: {e}")
 
+        # The World View globe, for the other feature's "show me" requests.
+        # Separate try/except: a failure to bind the map must not take the
+        # scanner's binding down with it, and the spoken answers do not depend
+        # on the map at all.
+        try:
+            from actions import world_look as _wl_action
+            _wl_action.bind_session(open_globe=self._world_open_globe)
+        except Exception as e:
+            print(f"[JARVIS] world look bind error: {e}")
+
+    def _world_open_globe(self, lat: float, lon: float, label: str) -> None:
+        """Show the globe centred on a place the voice just described.
+
+        The spoken answer is already complete by the time this runs, so the map
+        is the extra rather than the request -- but a failure here is still
+        printed rather than swallowed. A silent except here already cost one
+        debugging session: a NameError inside the window was absorbed, the
+        answer came out fine, and the map simply never appeared, with nothing in
+        any log to say why.
+        """
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is None:
+            return
+        for w in app.topLevelWidgets():
+            if hasattr(w, "focus_world"):
+                w.focus_world(float(lat), float(lon), str(label or ""))
+                return
+        print("[JARVIS] world look: no window with focus_world is open")
+
     def _de_gate_settled(self, key: str, started: bool) -> None:
         """A confirmation resolved. `started` is True only if a scan is now
         running.
