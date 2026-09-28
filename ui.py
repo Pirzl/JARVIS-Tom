@@ -6263,6 +6263,29 @@ class _RootShim:
 
 
 class JarvisUI:
+    # Windows groups taskbar buttons by AppUserModelID before it looks at
+    # anything else. Without one, every window launched from pythonw.exe is
+    # grouped as "python", and the taskbar shows python.exe's icon no matter
+    # what Qt is told -- `setWindowIcon` updates the title bar and Alt-Tab and
+    # the taskbar entry stays wrong.
+    #
+    # Declaring an ID is what lets the shell treat this as its own application
+    # and accept the icon from `app.setWindowIcon`. The ID is arbitrary as
+    # long as it is stable and unique per app; it is not a registry key and
+    # grants no permissions.
+    _APP_USER_MODEL_ID = "Pirzl.Jarvis.Tom"
+
+    def _declare_app_id(self) -> None:
+        try:
+            import ctypes
+            # 0 is S_OK. A non-zero result means the shell rejected the ID,
+            # which is survivable: the window still opens, it just keeps the
+            # interpreter's icon, so this is reported rather than raised.
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                self._APP_USER_MODEL_ID)
+        except Exception:  # noqa: BLE001 - cosmetics must never block startup
+            pass
+
     def __init__(self, face_path: str, size=None):
         # QtWebEngine (the World View globe) shares its GL contexts through this
         # attribute, and it must be set BEFORE the QApplication exists. Miss it
@@ -6272,6 +6295,10 @@ class JarvisUI:
         # globe is never opened.
         QApplication.setAttribute(
             Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+        # Before the QApplication exists. The shell reads the process's
+        # AppUserModelID when the first window is created, and this is the
+        # only point at which setting it still counts.
+        self._declare_app_id()
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
         self._apply_app_icon()

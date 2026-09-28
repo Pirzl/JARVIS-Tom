@@ -37,6 +37,29 @@ def _app() -> QApplication:
     return QApplication.instance() or QApplication([])
 
 
+def setUpModule():
+    """One QApplication for the whole module, created before any test runs.
+
+    Two reasons, and the second is a real crash. Qt destroys the application
+    object at interpreter shutdown, and a `QApplication` constructed inside a
+    test's `setUp` outlives the test that made it -- so a later test, or the
+    teardown of the last one, touches freed Qt state and the process dies with
+    0xC0000005 after every test has already reported green. That is the same
+    failure `test_world_view.py` has always had, arriving from a different
+    direction, and it is why the application is created here once and never
+    torn down by us.
+    """
+    _app()
+
+
+def tearDownModule():
+    """Deliberately does not quit or delete the application.
+
+    See `setUpModule`. Letting Python collect it at exit is the arrangement
+    that does not crash; explicitly disposing of it here is the one that does.
+    """
+
+
 class TestTheIconFileIsUsable(unittest.TestCase):
     """Before any Qt is involved: is the file a real icon?"""
 
@@ -124,6 +147,69 @@ class TestQIconIsActuallyImported(unittest.TestCase):
         self.assertTrue(hasattr(ui, "QIcon"),
                         "ui.py does not import QIcon; _apply_app_icon would "
                         "raise NameError the first time it runs")
+
+
+class TestTheAppIdIsDeclared(unittest.TestCase):
+    """The taskbar groups by AppUserModelID before it looks at anything else.
+
+    This is the test that would have caught the original bug. The icon tests
+    above all passed while the taskbar still showed the Python logo, because
+    loading the icon and having Windows display it are two separate problems
+    and only one of them is Qt's business.
+    """
+
+    def test_the_id_is_declared_and_readable_back(self):
+        import ctypes
+        helper = ui.JarvisUI.__new__(ui.JarvisUI)
+        helper._declare_app_id()
+        fn = ctypes.windll.shell32.GetCurrentProcessExplicitAppUserModelID
+        # argtypes matter: without them ctypes guesses the parameter types and
+        # the call returns garbage. That happened while writing this file and
+        # produced a plausible-looking but wrong ID, which would have made the
+        # test assert against noise.
+        fn.argtypes = [ctypes.POINTER(ctypes.c_wchar_p), ctypes.c_uint]
+        fn.restype = ctypes.c_long
+        buf = ctypes.c_wchar_p()
+        hr = fn(ctypes.byref(buf), ctypes.sizeof(buf))
+        self.assertEqual(hr, 0, "the shell refused the AppUserModelID")
+        self.assertEqual(buf.value, ui.JarvisUI._APP_USER_MODEL_ID)
+
+    def test_the_id_looks_like_an_app_id(self):
+        """Dotted, no spaces, not a path. The shell stores this verbatim and
+        uses it as a grouping key, so a malformed value groups unpredictably
+        rather than failing."""
+        app_id = ui.JarvisUI._APP_USER_MODEL_ID
+        self.assertIn(".", app_id)
+        self.assertNotIn(" ", app_id)
+        self.assertNotIn("\\", app_id)
+        self.assertNotIn("/", app_id)
+
+    def test_declaring_it_never_raises(self):
+        """Startup must not die over cosmetics. A shell that refuses the ID
+        still opens the window, just with the interpreter's icon."""
+        helper = ui.JarvisUI.__new__(ui.JarvisUI)
+        helper._declare_app_id()   # must not raise
+
+    def test_it_is_declared_before_the_application_exists(self):
+        """The shell reads the process AppUserModelID when the first window
+        appears. Setting it after the QApplication is constructed is the same
+        code with none of the effect."""
+        import inspect
+        src = inspect.getsource(ui.JarvisUI.__init__)
+        declare = src.find("_declare_app_id()")
+        make_app = src.find("QApplication(")
+        self.assertNotEqual(declare, -1)
+        self.assertNotEqual(make_app, -1)
+        self.assertLess(declare, make_app,
+                        "the ID must be declared before the QApplication")
+
+    def test_on_other_platforms_it_is_a_no_op(self):
+        """The class is imported on Linux and macOS too, where shell32 does
+        not exist. The whole call has to be inside the try."""
+        import inspect
+        src = inspect.getsource(ui.JarvisUI._declare_app_id)
+        self.assertIn("try:", src)
+        self.assertIn("except", src)
 
 
 class TestMutationChecks(unittest.TestCase):
