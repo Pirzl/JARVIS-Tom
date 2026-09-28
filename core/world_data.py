@@ -65,9 +65,20 @@ GEV_ENV = Path(__file__).resolve().parent.parent / "vendor" / "gods-eye" / ".env
 
 # NASA names a set of "last N hours" datasets. MLAST24h is the one a question
 # about fires today means; the per-sensor sources are what the Globe app layers
-# for detail. MLAST24h is used because a "is there fire near X" question is
-# about the last day, not about one satellite's pass.
-FIRMS_SOURCE = "MLAST24h"
+# for detail.
+#
+# This was `MLAST24h`, which is not a sensor. It is a WMS/WFS layer name that
+# was never valid here, and the API rejected it with 400 `Invalid source.` --
+# an error that reads like a rejected key, which is why a working credential
+# was repeatedly suspected of being wrong. Every documented source starts with
+# VIIRS_ or MODIS_, and the endpoint answers 400 when the segment is absent,
+# so there is no "just omit it" fallback.
+#
+# VIIRS_SNPP_NRT is the near-real-time product, usable within a few hours of
+# the overpass. For "is anything burning near me" that freshness is the whole
+# point; the standard-processing products lag by a day or more, and a wildfire
+# that is a day old is history.
+FIRMS_SOURCE = "VIIRS_SNPP_NRT"
 
 USER_AGENT = "jarvis-osint/1.0 (personal assistant; local use)"
 
@@ -432,6 +443,24 @@ def firms_key() -> str:
     return ""
 
 
+def _first_present(cells: list, idx: dict, names: tuple):
+    """The first of `names` this row actually has, or None.
+
+    FIRMS is two sensors sharing one endpoint, and they do not agree on column
+    names: MODIS writes `brightness`, VIIRS writes `bright_ti4`/`bright_ti5`.
+    Reaching for a single name means the other sensor parses into rows with
+    that field quietly set to None -- a missing reading that looks like a
+    sensor that measured nothing, which is a different and wrong claim.
+    """
+    for name in names:
+        i = idx.get(name)
+        if i is not None and i < len(cells):
+            value = cells[i]
+            if value not in ("", None):
+                return value
+    return None
+
+
 def fires_near(lat: float, lon: float, radius_km: float = 150.0,
                days: int = 1, limit: int = 10) -> dict:
     """Active fire detections near a place, from NASA's VIIRS/FIRMS.
@@ -469,6 +498,15 @@ def fires_near(lat: float, lon: float, radius_km: float = 150.0,
     box = ",".join("%.4f" % v for v in (
         lon - dlon, lat - dlat, lon + dlon, lat + dlat))
 
+    # The path order is KEY/SOURCE/BOX/DAYS, and getting it wrong fails in a
+    # way that looks like a credential problem. Passing a date where the source
+    # belongs returns 400 `Invalid source.` -- which reads like a bad key, and
+    # sent us looking at the key for a while instead of at this line.
+    #
+    # The source is not optional either. Without it the API answers 400 on
+    # every call, so "just omit it" is not the fallback. VIIRS_SNPP_NRT is the
+    # near-real-time product: available within hours, which is what makes it
+    # useful for "is anything burning near me right now".
     url = ("https://firms.modaps.eosdis.nasa.gov/api/area/csv/%s/%s/%s/%d"
            % (urllib.parse.quote(key), FIRMS_SOURCE, box, int(days)))
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -532,7 +570,16 @@ def fires_near(lat: float, lon: float, radius_km: float = 150.0,
             # These are satellite names, not places: "VIIRS" is the sensor.
             "satellite": (cells[idx["satellite"]] if "satellite" in idx else None),
             "confidence": (cells[idx["confidence"]] if "confidence" in idx else None),
-            "brightness": (cells[idx["brightness"]] if "brightness" in idx else None),
+            # VIIRS and MODIS name this column differently and the old code
+            # only knew one of them. `brightness` is MODIS; VIIRS reports
+            # `bright_ti4` (and `bright_ti5`). Looking up one name and getting
+            # None was silent -- the row still parsed, the reading just
+            # vanished -- so both are accepted and whichever is present is
+            # used. `frp` is the number worth saying out loud anyway, in
+            # megawatts, and it is spelled the same in both.
+            "brightness": _first_present(cells, idx,
+                                         ("brightness", "bright_ti4",
+                                          "bright_ti5")),
             "acq_date": (cells[idx["acq_date"]] if "acq_date" in idx else None),
             "acq_time": (cells[idx["acq_time"]] if "acq_time" in idx else None),
             "frp": (float(cells[idx["frp"]]) if "frp" in idx
