@@ -84,9 +84,35 @@ class DeepEyeSessionMixin:
         # on the map at all.
         try:
             from actions import world_look as _wl_action
-            _wl_action.bind_session(open_globe=self._world_open_globe)
+            _wl_action.bind_session(
+                open_globe=self._world_open_globe,
+                show_markers=self._world_show_markers,
+            )
         except Exception as e:
             print(f"[JARVIS] world look bind error: {e}")
+
+    def _world_show_markers(self, payload: dict) -> None:
+        """Hand a marker payload to the globe, if it is open.
+
+        Best-effort and quiet on failure, unlike the camera hook. The camera
+        being wrong is obvious -- the map shows the wrong place -- whereas a
+        missing dot is easy to miss, so a marker failure is reported and then
+        ignored rather than allowed to interrupt the user. The spoken answer
+        was delivered before this was called either way.
+        """
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is None:
+            return
+        for w in app.topLevelWidgets():
+            panel = getattr(w, "_world_panel", None)
+            if panel is not None and hasattr(panel, "show_markers"):
+                # A False here means the globe is closed or the page would not
+                # accept the script. Both are ordinary: the answer has already
+                # been spoken, and the user may simply not have the map open.
+                panel.show_markers(payload)
+                return
+        print("[JARVIS] world look: no hay globo abierto para los marcadores")
 
     def _world_open_globe(self, lat: float, lon: float, label: str) -> None:
         """Show the globe centred on a place the voice just described.

@@ -49,6 +49,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 # Never let a slow or hostile endpoint hold up the assistant's answer. These are
@@ -141,6 +142,17 @@ def _cached(kind: str, produce):
 
 # ── geometry ────────────────────────────────────────────────────────────────
 
+def _stamp() -> str:
+    """The moment a lookup was made, in the user's own timezone.
+
+    Local time rather than UTC because the answer is spoken aloud: "14:32" is
+    useful, "12:32Z" is something to convert before it means anything. Also the
+    reason a dot on the globe is never undated -- a marker with no time on it
+    reads as current fact long after it stopped being one.
+    """
+    return datetime.now().astimezone().strftime("%H:%M")
+
+
 def distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle distance in kilometres.
 
@@ -213,8 +225,17 @@ def geocode(place: str) -> dict:
 
 
 def aircraft_near(lat: float, lon: float, radius_km: float = 150.0,
-                  limit: int = 12) -> dict:
+                  limit: int = 60) -> dict:
     """Aircraft within radius_km, nearest first, with times and what they are.
+
+    The default limit is 60, not 12. `count` reports everything the source
+    found within the radius while the list is truncated, which is correct for a
+    spoken answer -- "there are 19, the closest is X" -- and was quietly wrong
+    for the map. The globe could only draw the 12 in the list, so a voice that
+    said 19 was followed by a map showing 12, with no way for the user to tell
+    the picture was a subset. Twelve was picked when nothing was drawn, purely
+    to keep the response small; now that the whole list is the picture, the
+    limit has to cover what the voice claims exists.
 
     Uses adsb.lol rather than OpenSky: measured from here, OpenSky's anonymous
     access returned nothing inside a tight box around Jerez while adsb.lol
@@ -286,6 +307,7 @@ def aircraft_near(lat: float, lon: float, radius_km: float = 150.0,
             "count": len(out),
             "aircraft": out[:limit],
             "source": "adsb.lol",
+            "queried_at": _stamp(),
         }
 
     return _cached("aircraft:%.3f,%.3f:%d" % (lat, lon, int(radius)), produce)
@@ -337,6 +359,7 @@ def earthquakes_near(lat: float, lon: float, radius_km: float = 800.0,
             "count": len(out),
             "quakes": out[:limit],
             "source": "USGS",
+            "queried_at": _stamp(),
         }
 
     return _cached("quakes:%.2f,%.2f:%d:%.1f"
@@ -382,7 +405,7 @@ def satellites(limit: int = 20) -> dict:
                 "inclination_deg": row.get("INCLINATION"),
             })
         return {"count": len(out), "satellites": out[:limit],
-                "source": "CelesTrak"}
+                "source": "CelesTrak", "queried_at": _stamp()}
 
     return _cached("satellites", produce)
 
@@ -484,7 +507,8 @@ def fires_near(lat: float, lon: float, radius_km: float = 150.0,
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if not lines:
         return {"centre": {"lat": lat, "lon": lon}, "radius_km": radius,
-                "count": 0, "fires": [], "source": "NASA FIRMS"}
+                "count": 0, "fires": [], "source": "NASA FIRMS",
+            "queried_at": _stamp()}
     header = lines[0].split(",")
     idx = {name.strip(): i for i, name in enumerate(header)}
 
@@ -517,7 +541,8 @@ def fires_near(lat: float, lon: float, radius_km: float = 150.0,
     out.sort(key=lambda f: f["distance_km"])
     return {"centre": {"lat": lat, "lon": lon}, "radius_km": radius,
             "count": len(out), "fires": out[:limit],
-            "source": "NASA FIRMS (%s)" % FIRMS_SOURCE}
+            "source": "NASA FIRMS (%s)" % FIRMS_SOURCE,
+            "queried_at": _stamp()}
 
 
 def weather(lat: float, lon: float) -> dict:

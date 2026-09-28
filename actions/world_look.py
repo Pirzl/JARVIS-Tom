@@ -52,11 +52,55 @@ from core import world_data as wd  # noqa: E402
 # depend on it: if opening fails, the data is still returned.
 _open_globe = None
 
+# Set by bind_session, next to the camera hook. Drawing the points a spoken
+# answer described is the second thing the globe can be asked to do, and binding
+# both together means one place turns the map on for JARVIS.
+_show_markers = None
 
-def bind_session(open_globe=None) -> None:
+# The raw results behind the sentence just spoken, so the markers can be built
+# from the same lookup rather than a second one. This is not an optimisation.
+# Aircraft and earthquake data is cached for 30 and 60 seconds, so a second
+# query moments later can legitimately return something different -- and then
+# the map would show points the spoken answer never mentioned, or omit ones it
+# did. Keyed by kind, so a briefing does not leave an aircraft-only payload
+# behind for the next question to pick up by mistake.
+_last_results: dict = {}
+
+
+def bind_session(open_globe=None, show_markers=None) -> None:
     """Wire the globe window in. Called once by JarvisLive.__init__."""
-    global _open_globe
+    global _open_globe, _show_markers
     _open_globe = open_globe
+    _show_markers = show_markers
+
+
+def _with_markers(answer: str, kind: str, place: dict, want_globe: bool) -> str:
+    """The spoken answer, plus the same facts drawn on the globe.
+
+    The sentence is returned untouched and always. Everything after this is a
+    best-effort extra: a globe that is not open, a page that will not accept
+    script, a marker payload that cannot be built -- none of it changes a single
+    word of what the user hears, because the answer they asked for is already
+    complete before this runs.
+
+    Markers go to the globe whether or not `show_on_map` was asked for, as long
+    as it is already open. "Show me" then only means "also move the camera" --
+    which is the right division, because a report about a place is nearly always
+    about somewhere you are already looking.
+    """
+    if _show_markers is not None:
+        data = _last_results.get(kind)
+        try:
+            from core import world_markers
+            payload = world_markers.payload(kind, data or {}, place)
+            _show_markers(payload)
+        except Exception as exc:                          # noqa: BLE001
+            # Never let decoration become breakage. The voice answer is the
+            # product; the dots are an extra, and an extra must not be able to
+            # take the answer down with it.
+            print("[JARVIS] world look: no se pudieron enviar los marcadores "
+                  "(%s: %s)" % (type(exc).__name__, exc))
+    return answer
 
 
 def _show_on_globe(place: dict) -> str:
@@ -125,6 +169,8 @@ def _fmt_place(place: dict) -> str:
 
 def _aircraft(place: dict, radius_km: float, want_globe: bool) -> str:
     data = wd.aircraft_near(place["lat"], place["lon"], radius_km)
+    # Kept so the globe can draw exactly these aircraft, not a fresh query.
+    _last_results["aircraft"] = data
     if data["count"] == 0:
         return ("Ahora mismo no veo ningún avión en un radio de %d km alrededor "
                 "de %s. Fuente %s, consultado a las %s."
@@ -154,6 +200,7 @@ def _aircraft(place: dict, radius_km: float, want_globe: bool) -> str:
 
 def _quakes(place: dict, radius_km: float) -> str:
     data = wd.earthquakes_near(place["lat"], place["lon"], radius_km)
+    _last_results["earthquakes"] = data
     if data["count"] == 0:
         return ("No hay terremotos de magnitud 2.5 o superior en %d km alrededor "
                 "de %s en las últimas 24 horas. Fuente %s, a las %s."
@@ -212,6 +259,7 @@ def _fires(place: dict, radius_km: float) -> str:
     """
     try:
         data = wd.fires_near(place["lat"], place["lon"], radius_km)
+        _last_results["fires"] = data
     except wd.WorldDataError as exc:
         detail = str(exc)
         low = detail.lower()
@@ -278,6 +326,11 @@ def _briefing(place: dict, radius_km: float, want_globe: bool) -> str:
     would not be.
     """
     data = wd.snapshot(place["query"], radius_km)
+    # A briefing covers several sources at once, so the aircraft part is what
+    # gets drawn -- it is the only layer here with positions, and drawing four
+    # kinds of marker in one go would be a colour chart rather than a map.
+    if data.get("aircraft"):
+        _last_results["overview"] = data["aircraft"]
     head = ["Resumen de %s:" % _fmt_place(data["place"])]
 
     air = data.get("aircraft")
@@ -401,13 +454,17 @@ def world_look(parameters: dict, speak=None) -> str:
 
     try:
         if action in ("overview", "briefing", "brief", "todo"):
-            return _briefing(located, radius_km, want_globe)
+            return _with_markers(_briefing(located, radius_km, want_globe),
+                                 "overview", located, want_globe)
         if action in ("aircraft", "flights", "aviones", "vuela", "overhead"):
-            return _aircraft(located, radius_km, want_globe)
+            return _with_markers(_aircraft(located, radius_km, want_globe),
+                                 "aircraft", located, want_globe)
         if action in ("earthquakes", "terremotos", "seismic", "sismos"):
-            return _quakes(located, radius_km)
+            return _with_markers(_quakes(located, radius_km),
+                                 "earthquakes", located, True)
         if action in ("fires", "incendios", "fuego", "wildfires"):
-            return _fires(located, radius_km)
+            return _with_markers(_fires(located, radius_km),
+                                 "fires", located, True)
         if action in ("weather", "tiempo", "meteo", "clima"):
             return _weather(located)
     except wd.WorldDataError as exc:

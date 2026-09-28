@@ -430,8 +430,54 @@ class GlobePanel(QWidget):
         # Insert the view directly above the header, below which the layout has
         # the placeholder's slot.
         self.layout().insertWidget(self.layout().count() - 1, view)
+        view.loadFinished.connect(self._on_page_ready)
         view.load(QUrl(self._page_url()))
         return True
+
+    def _on_page_ready(self, ok: bool) -> None:
+        """Once the page has loaded, clear the first-launch dialog out of the way.
+
+        The Globe app opens with a "Choose your first view" panel dead centre,
+        over exactly the ground a voice answer is about. It is the app's own
+        first-run flow, meant for a person clicking through it once; from inside
+        JARVIS nobody is going to, and it hid both the markers and their labels
+        during testing -- a correct drawing that read as a missing one.
+
+        Dismissed rather than configured: choosing a scene on the user's behalf
+        would be deciding what they want to look at. "Don't show this again" is
+        the honest middle ground -- the panel goes, the preference is theirs to
+        set in the app if they want it back.
+        """
+        if not ok or self._view is None:
+            return
+        self._dismiss_first_run_dialog()
+
+    def _dismiss_first_run_dialog(self) -> None:
+        script = (
+            "(function(){"
+            "  try {"
+            # The 'Don't show this again' control, so the app stops asking.
+            "  var labels = ['Explore Manually', 'Don\\'t show this again'];"
+            "  var btns = document.querySelectorAll('button, [role=button],"
+            "    label, .choice, .onboard-card, .start-card');"
+            "  for (var i = 0; i < btns.length; i++) {"
+            "    var el = btns[i];"
+            "    var t = (el.textContent || '').trim();"
+            "    for (var j = 0; j < labels.length; j++) {"
+            "      if (t === labels[j] || t.indexOf(labels[j]) === 0) {"
+            "        el.click(); return 'clicked:' + t;"
+            "      }"
+            "    }"
+            "  }"
+            "  return 'no-dialog';"
+            "})()"
+        )
+        try:
+            self._view.page().runJavaScript(script)
+        except Exception:                                 # noqa: BLE001
+            # Cosmetic only. If the app's markup changes and the dialog stays,
+            # the map still works and the user can close it by hand.
+            pass
 
     def _page_url(self) -> str:
         """The app URL, carrying any pending camera position.
@@ -511,6 +557,44 @@ class GlobePanel(QWidget):
             # The page may be mid-navigation. _pending_focus still holds the
             # position, so the next load lands correctly.
             self._set_status("focus pending (%s)" % type(exc).__name__, "#ffd166")
+
+    def show_markers(self, payload: dict) -> bool:
+        """Draw what a spoken answer just described, on the globe already open.
+
+        Fire-and-forget through runJavaScript, for the same reason focus_globe
+        is: the page is mid-render and a callback from it is not dependable. That
+        this call returned is not evidence the dots appeared -- that is checked
+        by reading the page afterwards. What it honestly reports is whether the
+        request was dispatched at all.
+
+        An empty marker list is still worth sending. It clears whatever the
+        previous answer drew, so asking about a second place does not leave the
+        first one's results sitting on the map looking current.
+
+        The globe has to be open for this. It is deliberately not opened on
+        demand: the voice answer is complete without it, and a globe appearing
+        unasked while someone is mid-sentence is a worse surprise than a missing
+        dot. The caller decides, and "show me" is the caller.
+        """
+        if self._view is None or not payload:
+            return False
+        try:
+            js = (
+                "window.dispatchEvent(new CustomEvent('gev:jarvis-markers',"
+                "{detail:%s}));" % json.dumps(payload, ensure_ascii=False)
+            )
+            self._view.page().runJavaScript(js)
+        except Exception as exc:                            # noqa: BLE001
+            # A map problem must never become a spoken-answer problem: the
+            # sentence has already been delivered by the time this runs.
+            self._set_status("marcadores no (%s)" % type(exc).__name__,
+                             "#ffd166")
+            return False
+        count = payload.get("count")
+        if isinstance(count, int) and count:
+            self._set_status("%d puntos · %s" % (count, payload.get("source", "")),
+                             "#76ff03")
+        return True
 
     def _make_resize_hook(self, view):
         base = view.resizeEvent
