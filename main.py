@@ -80,6 +80,7 @@ from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from core.live_config          import LiveConfigMixin
 from core.background_loops     import BackgroundLoopsMixin
+from core.wake_session         import WakeMixin
 from core.deep_eye_session     import DeepEyeSessionMixin
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
@@ -98,17 +99,6 @@ from core.wake_word            import (
 # the mic is far away and waking it by hand is impractical.
 WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
 
-def _wake_state_label(seconds: float) -> str:
-    """Human form of a listening window, for the log and the settings row."""
-    t = float(seconds)
-    if t <= 0:
-        return "never"
-    if t < 60:
-        return f"{t:g} seconds"
-    if t % 60 == 0:
-        mins = int(t // 60)
-        return f"{mins} minute{'s' if mins != 1 else ''}"
-    return f"{t:g} seconds"
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -581,7 +571,9 @@ def _keep_context_of(exc: BaseException) -> bool:
     return True
 
 
-class JarvisLive(LiveConfigMixin, BackgroundLoopsMixin, DeepEyeSessionMixin):
+class JarvisLive(
+    WakeMixin,
+LiveConfigMixin, BackgroundLoopsMixin, DeepEyeSessionMixin):
     # core/live_config.py builds the LiveConnectConfig and reads a handful of
     # names that live at main.py module level (the prompt template helpers and
     # the inline tool declarations). Binding them here keeps the extracted
@@ -733,142 +725,6 @@ class JarvisLive(LiveConfigMixin, BackgroundLoopsMixin, DeepEyeSessionMixin):
 
     # ── Wake word: state machine ─────────────────────────────────────────────
 
-    def _wake_state(self) -> dict:
-        # A loaded, running detector is definitively ready; otherwise fall back
-        ready = bool(self._wake_detector and self._wake_detector.ready) or wake_is_ready()
-        # "ready" and "listening" are different: the model can be present on disk
-        # while the detector was never started, and then the setting is on but
-        # the wake word can never fire. The UI shows that difference.
-        running = bool(self._wake_detector and self._wake_detector.ready
-                       and getattr(self._wake_detector, "_running", False))
-        t = float(self._wake_sleep_timeout)
-        if t <= 0:
-            label = "∞"
-        elif t < 60:
-            label = f"{t:g}s"
-        elif t % 60 == 0:
-            label = f"{int(t // 60)}min"
-        else:
-            label = f"{t:g}s"
-        return {"enabled": self._wake_enabled, "awake": self._awake,
-                "ready": ready, "detector_running": running,
-                "timeout": t, "timeout_label": label}
-
-    def _set_wake_timeout_live(self, seconds: float) -> None:
-        """Apply a new listening window to the running session.
-
-        Called from the settings row so a change takes effect at once instead of
-        needing a restart. The config write is done by the caller; this only
-        updates the value the sleep watcher reads.
-        """
-        self._wake_sleep_timeout = max(0.0, float(seconds))
-        self._last_user_speech = time.monotonic()   # restart the window now
-        if self._awake:
-            self.ui.write_log(
-                f"SYS: Listening window set to "
-                f"{'never sleep' if self._wake_sleep_timeout <= 0 else f'{self._wake_sleep_timeout:g}s'}"
-                f" — sleeping {_wake_state_label(self._wake_sleep_timeout)} from now.")
-        if not self._awake:
-            self.ui.set_state("SLEEPING")
-
-    def _ensure_wake_detector(self) -> bool:
-        """Load the detector once (model loads on first start). Idempotent."""
-        if self._wake_detector is None:
-            self._wake_detector = WakeWordDetector(
-                on_detect=self._on_wake_detected,
-                logger=lambda m: print(f"[Wake] {m}"),
-                notify=lambda m: self.ui.write_log(f"SYS: {m}"),
-            )
-        if not self._wake_detector.ready:
-            return self._wake_detector.start()
-        return True
-
-    def _on_wake_detected(self) -> None:
-        """Called from the detector thread when 'Hey Jarvis' is heard."""
-        self.wake(reason="wake word")
-
-    def wake(self, reason: str = "wake word") -> None:
-        if self._awake:
-            return
-        self._awake = True
-        self._last_user_speech = time.monotonic()   # start the auto-sleep clock now
-        if not self.ui.muted:
-            self.ui.set_state("LISTENING")
-        self.ui.write_log(f"SYS: Awake — {reason}.")
-
-    def sleep(self, reason: str = "timeout") -> None:
-        if not self._awake:
-            return
-        self._awake = False
-        self.set_speaking(False)
-        # Throw away the detector's audio state. While awake the mic does not
-        # feed the detector, so its buffers still hold the tail of what the user
-        # last said; the first chunks after sleeping would complete those
-        # features and report a wake word for a phrase that is already over.
-        if self._wake_detector is not None:
-            try:
-                self._wake_detector.reset()
-            except Exception as e:
-                print(f"[JARVIS] wake reset error: {e}")
-        self.ui.set_state("SLEEPING")
-        self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey Jarvis' to wake me.")
-
-    async def _run_sleep_watch(self) -> None:
-        """Auto-sleep after the configured silence window (wake-word mode only).
-
-        A window of 0 means "stay awake", so the check is skipped entirely —
-        without it, `elapsed > 0` is true on the very first tick and the
-        assistant would fall asleep instantly.
-        """
-        while True:
-            await asyncio.sleep(5)
-            if not self._wake_enabled or not self._awake:
-                continue
-            if self._wake_sleep_timeout <= 0:
-                continue
-            with self._speaking_lock:
-                speaking = self._is_speaking
-            if speaking:
-                continue
-            if (time.monotonic() - self._last_user_speech) > self._wake_sleep_timeout:
-                mins = round(self._wake_sleep_timeout / 60.0)
-                when = f"{mins} minutes" if mins >= 1 else f"{self._wake_sleep_timeout:g} seconds"
-                self.sleep(reason=f"no speech for {when}")
-
-    # ── Wake word: UI callbacks (called from the Qt thread) ──────────────────
-
-    def _ui_wake_toggle(self, enable: bool) -> str:
-        """Enable/disable wake word from the settings UI. Returns a status token:
-        'enabled' | 'disabled' | 'need_download'."""
-        if enable:
-            if not wake_is_ready():
-                return "need_download"
-            self._wake_enabled = True
-            save_wake_word_enabled(True)
-            self._ensure_wake_detector()
-            self.sleep(reason="wake word enabled")
-            return "enabled"
-        else:
-            self._wake_enabled = False
-            save_wake_word_enabled(False)
-            self.wake(reason="wake word disabled")
-            return "disabled"
-
-    def _ui_wake_manual(self) -> None:
-        """Manual sleep/wake button in the UI."""
-        if not self._wake_enabled:
-            return
-        if self._awake:
-            self.sleep(reason="you tapped sleep")
-        else:
-            self.wake(reason="you tapped wake")
-
-    def _ui_wake_install(self) -> tuple[bool, str]:
-        """Download openwakeword + the model (runs in a UI worker thread)."""
-        # Triggered by the user pressing the button, so its progress is exactly
-        # what they are waiting to see.
-        return wake_install(logger=lambda m: print(f"[Wake] {m}"),
-                            notify=lambda m: self.ui.write_log(f"SYS: {m}"))
 
     def plugin_say(self, instruction: str) -> None:
         """
@@ -966,6 +822,10 @@ class JarvisLive(LiveConfigMixin, BackgroundLoopsMixin, DeepEyeSessionMixin):
         if self._wake_enabled and not self._awake:
             self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
             return
+        # Typing is speech activity too. Without this the silence window is
+        # measured from whenever JARVIS woke, so a 20 s window closes in the
+        # middle of a typed conversation that is going perfectly well.
+        self._last_user_speech = time.monotonic()
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": text}]},
@@ -1406,6 +1266,13 @@ class JarvisLive(LiveConfigMixin, BackgroundLoopsMixin, DeepEyeSessionMixin):
 
             if not self.ui.muted and not self._phone_active:
                 data = indata.tobytes()
+                # Restart the silence window from the block that is about to go
+                # to the model. This is the only reliable place to do it: the
+                # wake word is detected locally, so the user's first utterance
+                # after waking is answered without a transcription ever being
+                # reported, and the clock would otherwise be measured from the
+                # moment of waking rather than from the conversation.
+                self._mark_user_activity(_pcm_level(indata))
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
                     {"data": data, "mime_type": "audio/pcm"}
