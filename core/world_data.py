@@ -644,7 +644,31 @@ def sources() -> dict:
             out[label] = {"ok": False,
                           "detail": "%s: %s" % (type(exc).__name__, exc)[:120]}
     out["fires (NASA FIRMS)"] = _firms_status()
+    # The image library is a different service with its own key, and it works
+    # even when fire detection does not. Keeping them as separate entries is
+    # the point: "NASA is broken" is not a thing a user can act on, whereas
+    # "fire detection is down, images are fine" is.
+    out["images (NASA library)"] = _nasa_images_status()
     return out
+
+
+def _nasa_images_status() -> dict:
+    """Is the image library available?
+
+    Unlike the other entries this does not make a request. The search endpoint
+    answers 200 without a key, so probing it on every doctor run would spend a
+    rate-limited call to learn nothing that configuration cannot say, and a
+    check that reports red on a network blip is a check people switch off. It
+    reports what is configured; `core.nasa_images.search_images` reports what
+    is reachable, and says which of the two went wrong.
+    """
+    try:
+        from core.nasa_images import source_status as _si
+        st = _si()
+    except Exception as exc:                             # noqa: BLE001
+        return {"ok": False, "detail": "module unavailable: %s" % exc}
+    return {"ok": st["configured"],
+            "detail": st["note"][:120]}
 
 
 def _firms_status() -> dict:
