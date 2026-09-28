@@ -95,6 +95,32 @@ class TestTheRealScannerOutputIsJudged(unittest.TestCase):
         self.assertTrue(first["verify_reasons"],
                         "a downgrade with no reason is a silent lie")
 
+    def test_a_tool_finding_still_cannot_stay_high_without_arguing(self):
+        """Phase 2's rule, on the real path.
+
+        A finding with real tool evidence is `verified` and keeps `high` from
+        the evidence gate -- but the confidence gate then asks the second
+        question: did anyone argue against it, and was the impact shown? A
+        scanner that reports a reflected XSS with the body attached and nothing
+        else has not done either. `medium`, with both reasons recorded.
+
+        The asserted `high` stays on the finding, so a reader can see what was
+        claimed and why it was lowered.
+        """
+        f = _judge_findings([{
+            "title": "Reflected XSS",
+            "severity": "high",
+            "provenance": "tool",
+            "evidence": [{"type": "response",
+                          "detail": "body echoed the payload verbatim"}],
+        }])[0]
+        self.assertTrue(f["verified"], "the evidence gate still confirms it")
+        self.assertEqual(f["severity"].lower(), "medium",
+                         "no counterevidence and no demonstrated impact")
+        self.assertEqual(f["asserted_severity"].lower(), "high")
+        self.assertFalse(f["has_counterevidence"])
+        self.assertTrue(f["review_reasons"])
+
     def test_a_bare_assertion_falls_to_low(self):
         second = self.judged[1]
         self.assertEqual(second["severity"].lower(), "low")
@@ -113,7 +139,13 @@ class TestTheRealScannerOutputIsJudged(unittest.TestCase):
                              f"unearned verification on: {f['title']}")
 
     def test_evidence_text_becomes_real_evidence(self):
-        """A scanner that reports its own evidence block should be believed."""
+        """A scanner that reports its own evidence block should be believed.
+
+        `verified` is the evidence gate's word and it stands: the response was
+        observed. The severity is the confidence gate's, and it is `medium`
+        because nothing argued against the finding -- the two gates answer
+        different questions and this test keeps them apart.
+        """
         f = _judge_findings([{
             "title": "Reflected XSS",
             "severity": "high",
@@ -121,17 +153,25 @@ class TestTheRealScannerOutputIsJudged(unittest.TestCase):
             "evidence_text": "HTTP 200 body contains <script>alert(1)</script>",
         }])[0]
         self.assertTrue(f["verified"], f.get("verify_reasons"))
+        self.assertEqual(f["severity"].lower(), "medium")
 
-    def test_an_explicit_tool_provenance_keeps_its_severity(self):
+    def test_the_evidence_gate_keeps_its_own_verdict(self):
+        """Phase 1's promise still holds under Phase 2's rules.
+
+        The evidence gate confirmed this finding on real tool output. Phase 2
+        lowered its severity, and deliberately did not touch `verified` --
+        "we saw the response" and "this is a serious bug" are separate claims
+        and lowering one must not quietly lower the other.
+        """
         f = _judge_findings([{
             "title": "Reflected XSS",
-            "severity": "high",
+            "severity": "critical",
             "provenance": "tool",
             "evidence": [{"type": "response",
                           "detail": "body echoed the payload verbatim"}],
         }])[0]
-        self.assertEqual(f["severity"].lower(), "high")
         self.assertTrue(f["verified"])
+        self.assertNotEqual(f["severity"].lower(), "critical")
 
 
 class TestJunkDoesNotBreakTheScan(unittest.TestCase):

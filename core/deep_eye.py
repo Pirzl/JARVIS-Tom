@@ -66,6 +66,7 @@ from actions.osint_scan import _normalize_target  # noqa: E402  (shared contract
 # findings cannot be believed without passing it, and it has to be somewhere
 # the scanners cannot reach around.
 from core.evidence_gate import EvidenceGate  # noqa: E402
+from core.confidence_gate import ConfidenceGate  # noqa: E402
 
 
 class DeepEyeUnavailable(RuntimeError):
@@ -278,6 +279,7 @@ def _judge_findings(findings: list) -> list:
     whoever is fixing the bug.
     """
     gate = EvidenceGate()
+    review = ConfidenceGate()
     out: list = []
     for raw in findings or []:
         if not isinstance(raw, dict):
@@ -289,7 +291,22 @@ def _judge_findings(findings: list) -> list:
                 "type": "response",
                 "detail": str(finding["evidence_text"]),
             }]
-        out.append(gate.apply(finding))
+        gated = gate.apply(finding)
+        # The second gate, and it runs second. The evidence gate decides what
+        # is real; this one decides how loudly to say it, and it can only
+        # lower a severity, never raise one. A finding with no counterevidence
+        # is not discarded -- it is reported lower, with the reason attached,
+        # because silently dropping it is the same dishonesty as inflating it.
+        #
+        # The first gate's `asserted_severity` is carried forward rather than
+        # overwritten. Both gates keep an "asserted" field, and the second one
+        # would otherwise replace `critical` with the already-lowered `medium`,
+        # losing the scanner's original claim from the report entirely. The
+        # original is the thing a reader needs in order to disagree.
+        claimed = gated.get("asserted_severity") or finding.get("severity")
+        judged = review.review(gated, impact_demonstrated=False)
+        judged.fields["asserted_severity"] = claimed
+        out.append(judged.fields)
     return out
 
 
