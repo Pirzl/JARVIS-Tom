@@ -69,6 +69,7 @@ from actions.osint_scan import _normalize_target  # noqa: E402  (shared contract
 from core.evidence_gate import EvidenceGate  # noqa: E402
 from core.confidence_gate import ConfidenceGate  # noqa: E402
 from core.scan_coverage import build_coverage, ALL_CHECKS  # noqa: E402
+from core.evidence_ladder import build_honesty_block  # noqa: E402
 
 
 class DeepEyeUnavailable(RuntimeError):
@@ -211,6 +212,7 @@ class ScanResult:
     findings: list = field(default_factory=list)
     report_path: Optional[Path] = None
     coverage_path: Optional[Path] = None
+    honesty: Optional[dict] = None
 
     @property
     def ok(self) -> bool:
@@ -223,14 +225,23 @@ class ScanResult:
         that aloud is useless and leaks attack material into the audio stream.
         Severity counts are what a person actually needs to hear.
 
-        The coverage clause is not decoration. "Scan finished with no findings"
-        and "scan checked 23 of 23 things and found nothing" are different
-        claims, and only the second is evidence. Saying the first when the
-        scanner died halfway is how a broken tool gets mistaken for a healthy
-        site.
+        The honesty block leads, because it is the part that makes the rest
+        readable. Counts of severity are what most people want to hear, and
+        they are also what lets them over-trust: "3 high" from a scan that only
+        ran four of twenty-three checks is a very different sentence from the
+        same three, and leading with the counts is how a broken tool gets
+        filed as a healthy one.
+
+        So the caveats come first, then the numbers. A finding's raw evidence
+        is a SQL injection string or a token; reading that aloud is useless and
+        leaks attack material into the audio stream, so only counts are spoken.
         """
+        honesty = ""
+        if self.honesty and self.honesty.get("headline"):
+            honesty = self.honesty["headline"]
+
         coverage = ""
-        if self.coverage_path is not None:
+        if self.coverage_path is not None and not honesty:
             try:
                 data = json.loads(self.coverage_path.read_text(encoding="utf-8"))
                 total, done = data.get("total_available"), data.get("covered")
@@ -243,9 +254,9 @@ class ScanResult:
                                 f"does not mean the site is clean.")
             except (OSError, ValueError):
                 coverage = ""
+        tail = f" {honesty}" if honesty else coverage
         if not self.findings:
-            return (f"Scan of {self.target} finished with no findings."
-                    f"{coverage}")
+            return f"Scan of {self.target} finished with no findings.{tail}"
         by_sev: dict = {}
         for f in self.findings:
             sev = str(f.get("severity", "unknown")).lower()
@@ -255,7 +266,7 @@ class ScanResult:
         parts = [f"{by_sev[s]} {s}" for s in order]
         return (f"Scan of {self.target} finished: "
                 f"{len(self.findings)} finding{'s' if len(self.findings) != 1 else ''}"
-                f" ({', '.join(parts)}).{coverage}")
+                f" ({', '.join(parts)}).{tail}")
 
 
 def _gemini_key() -> str:
@@ -606,9 +617,24 @@ class DeepEyeScan:
         # between "nothing found" and "nothing looked at".
         coverage = _write_coverage(self.target, output, findings,
                                    finished=code == 0)
+        # The honesty block leads the report and is what the voice reads
+        # first. It is built from the gated findings and the coverage record,
+        # so it cannot disagree with either: there is one set of findings and
+        # one coverage file, and the block is a view of both rather than a
+        # second summary written by hand.
+        try:
+            import json as _json
+            cov = _json.loads(coverage.read_text(encoding="utf-8")) \
+                if coverage is not None else None
+            honesty = build_honesty_block(findings, cov)
+        except (OSError, ValueError, TypeError):
+            # A report without the block is still a report; a scan that
+            # raises while being summarised is a scan that never finishes.
+            honesty = build_honesty_block(findings, None)
         self.result = ScanResult(target=self.target, returncode=code,
                                  output=output, findings=findings,
-                                 report_path=report, coverage_path=coverage)
+                                 report_path=report, coverage_path=coverage,
+                                 honesty=honesty)
         if self._cancelled.is_set():
             raise ScanCancelled(f"Scan of {self.target} was cancelled.")
         if code == -1 or (code != 0 and not output.strip()):
