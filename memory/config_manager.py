@@ -12,31 +12,27 @@ CONFIG_DIR = BASE_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "api_keys.json"
 CONFIG_VERSION = 1
 
-# ── 4-value contract ─────────────────────────────────────────────
-# OFF = 0 = hard guarantee, never auto-sleep
-# Only valid: 10, 20, 30, 0
-# Old 120, 900 etc are migrated to DEFAULT
+# ── 4-value contract ──
+# OFF = 0 = nunca duerme automático, solo manual
 ALLOWED_WAKE_SLEEP_TIMEOUTS = {10, 20, 30, 0}
 DEFAULT_WAKE_SLEEP_TIMEOUT = 20.0
 
 def _migrate_config(data: dict) -> dict:
-    """Apply config migrations while preserving unknown/plugin-owned keys."""
     version = data.get("config_version", 0)
     try:
         version = int(version)
     except (TypeError, ValueError):
         version = 0
-
     if version < 1:
         data["config_version"] = CONFIG_VERSION
     elif version > CONFIG_VERSION:
         return data
 
-    # Migrate old hidden timeouts (120, 900...) to DEFAULT
+    # Migrar viejos 120, 900... a DEFAULT
     if "wake_sleep_timeout" in data:
         raw = data["wake_sleep_timeout"]
         try:
-            if isinstance(raw, str) and raw.strip().lower() in ("off","never","∞","inf"):
+            if isinstance(raw, str) and raw.strip().lower() in ("off","never","∞","inf","none"):
                 iv = 0
             else:
                 iv = int(float(raw))
@@ -44,7 +40,6 @@ def _migrate_config(data: dict) -> dict:
                 data["wake_sleep_timeout"] = float(DEFAULT_WAKE_SLEEP_TIMEOUT)
         except Exception:
             data["wake_sleep_timeout"] = float(DEFAULT_WAKE_SLEEP_TIMEOUT)
-
     return data
 
 def ensure_config_dir() -> None:
@@ -139,8 +134,6 @@ def save_wake_word_enabled(enabled: bool) -> None:
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
 def get_wake_sleep_timeout() -> float:
-    """Only 10,20,30,0 valid. OFF=0 = hard guarantee never auto-sleep.
-       Old 120/900 etc -> DEFAULT (20). Missing -> DEFAULT."""
     raw = load_api_keys().get("wake_sleep_timeout", None)
     if raw is None:
         return float(DEFAULT_WAKE_SLEEP_TIMEOUT)
@@ -161,7 +154,6 @@ def get_wake_sleep_timeout() -> float:
     return float(iv)
 
 def save_wake_sleep_timeout(seconds: float) -> None:
-    """Save only allowed values. OFF string -> 0."""
     ensure_config_dir()
     data: dict = {}
     if CONFIG_FILE.exists():
