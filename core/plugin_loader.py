@@ -1,6 +1,7 @@
 """
 Plugin discovery, validation, collision detection, and dispatch.
 Mark LIV+ - compatible with original API.
+FIX: registry._plugins = valid borraba lo registrado por ensure_registered()
 """
 from __future__ import annotations
 
@@ -50,7 +51,6 @@ class PluginRegistry:
         self._logger = logger
         self._notify = notify or (lambda _msg: None)
 
-    # --- new: idempotent registration for tests ---
     def register(self, plugin_meta: dict, run_fn: Callable, file: str = "<dynamic>") -> PluginRecord:
         rec = _validate_meta(plugin_meta, run_fn, file)
         if not rec.valid:
@@ -102,7 +102,6 @@ class PluginRegistry:
         if not get_plugin_enabled(name):
             return f"The '{name}' plugin is currently disabled."
 
-        # REAL confirmation gate - token issued by UI, not model
         if rec.dangerous:
             try:
                 from core.confirm import is_token_valid, request_confirmation_banner
@@ -227,61 +226,10 @@ def discover_plugins(plugins_dir: Path, core_tool_names: set[str],
     global _REGISTRY
     _REGISTRY = registry
 
-    valid: dict[str, PluginRecord] = {}
-    all_records: list[PluginRecord] = []
+    # FIX: usar las mismas referencias que el registry, no dicts nuevos
+    # Así lo que registra ensure_registered() no se pierde al hacer = valid al final
+    valid: dict[str, PluginRecord] = registry._plugins
+    all_records: list[PluginRecord] = registry._all_records
     files = sorted(plugins_dir.glob("*.py"), key=lambda p: p.name)
 
     for path in files:
-        if path.name.startswith("_"): continue
-        try:
-            module_name = f"plugins.{path.stem}"
-            spec = importlib.util.spec_from_file_location(module_name, path)
-            if spec is None or spec.loader is None:
-                raise ImportError("could not build import spec")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
-            try:
-                spec.loader.exec_module(module)
-            except Exception:
-                sys.modules.pop(module_name, None)
-                raise
-
-            if hasattr(module, "ensure_registered"):
-                try:
-                    sig = inspect.signature(module.ensure_registered)
-                    if len(sig.parameters) == 0:
-                        module.ensure_registered()
-                    else:
-                        module.ensure_registered(registry)
-                except Exception as e:
-                    logger(f"Plugin {path.name} ensure_registered() failed: {e}")
-
-            rec = _validate(module, path.name)
-            if rec.valid and rec.name in core_tool_names:
-                rec = PluginRecord(name=rec.name, file=path.name, error=f"Name '{rec.name}' collides with a core tool — rejected.")
-            elif rec.valid and rec.name in valid:
-                other = valid[rec.name].file
-                rec = PluginRecord(name=rec.name, file=path.name, error=f"Name '{rec.name}' already used by '{other}' — rejected.")
-
-        except Exception as e:
-            rec = PluginRecord(name=path.stem, file=path.name, error=_load_error(path, plugins_dir, e))
-            logger(f"{traceback.format_exc()}")
-
-        all_records.append(rec)
-        if rec.valid:
-            valid[rec.name] = rec
-        else:
-            logger(f"Plugin rejected: {path.name} — {rec.error}")
-            try:
-                from core.events import EventBus
-                EventBus.emit("plugin.rejected", {"file": path.name, "error": rec.error})
-            except Exception:
-                pass
-
-    registry._plugins = valid
-    registry._all_records = all_records
-    rejected = len(all_records) - len(valid)
-    logger(f"Plugin discovery complete: {len(valid)} active, {rejected} rejected, {len(all_records)} total.")
-    if rejected and notify:
-        notify(f"{rejected} plugin(s) could not be loaded — see the console.")
-    return registry
