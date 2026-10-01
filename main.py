@@ -100,10 +100,23 @@ from core.wake_word            import (
 WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
 
 
-def get_base_dir():
+def get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
+        exe_dir = Path(sys.executable).parent
+        # PyInstaller one-dir: el exe está en dist/JARVIS-Tom/JARVIS-Tom.exe
+        # y core/prompt.txt está en dist/JARVIS-Tom/ o un nivel arriba
+        if hasattr(sys, "_MEIPASS"):
+            if (exe_dir / "core" / "prompt.txt").exists():
+                return exe_dir
+            if (exe_dir.parent / "core" / "prompt.txt").exists():
+                return exe_dir.parent
+            return exe_dir.parent
+        # Fallback sin _MEIPASS pero con layout dist/app/
+        if not (exe_dir / "core" / "prompt.txt").exists() and (exe_dir.parent / "core" / "prompt.txt").exists():
+            return exe_dir.parent
+        return exe_dir
     return Path(__file__).resolve().parent
+
 
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
