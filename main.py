@@ -97,7 +97,7 @@ from core.wake_word            import (
 # without editing code. 0.0 means "never auto-sleep" — the assistant stays
 # awake until you put it to sleep yourself, which is the right setting when
 # the mic is far away and waking it by hand is impractical.
-WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
+WAKE_SLEEP_TIMEOUT = 20.0   # seconds 
 
 
 def get_base_dir() -> Path:
